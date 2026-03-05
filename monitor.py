@@ -238,7 +238,7 @@ def format_reset(reset_val: str) -> str:
 
 
 WINDOW_LABELS = {"5h": "5 Hours", "7d": "7 Days", "24h": "24 Hours", "1h": "1 Hour"}
-WINDOW_EMOJI = {"5h": "\u23f1", "7d": "\U0001f4c5", "24h": "\u2600", "1h": "\u26a1"}
+WINDOW_EMOJI = {"5h": "[5h]", "7d": "[7d]", "24h": "[24h]", "1h": "[1h]"}
 
 
 class DropdownPanel:
@@ -257,56 +257,30 @@ class DropdownPanel:
             return THEME["orange"]
         return THEME["red"]
 
-    def show(self, data: dict | None, pos: tuple | None = None):
-        with self._lock:
-            if self._win is not None:
-                try:
-                    self._win.destroy()
-                except tk.TclError:
-                    pass
-                self._win = None
-
-        win = tk.Tk()
-        self._win = win
-        win.title("")
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        win.configure(bg=THEME["border"])
-
-        # Use passed position (captured at click time) or fallback to current mouse
-        if pos:
-            mx, my = pos
-        else:
-            mx, my = win.winfo_pointerx(), win.winfo_pointery()
-
-        # Main container with 1px border effect
-        outer = tk.Frame(win, bg=THEME["border"], padx=1, pady=1)
-        outer.pack(fill=tk.BOTH, expand=True)
-
-        container = tk.Frame(outer, bg=THEME["bg"], padx=0, pady=0)
-        container.pack(fill=tk.BOTH, expand=True)
-
-        # Header
-        header = tk.Frame(container, bg=THEME["surface"], padx=16, pady=10)
-        header.pack(fill=tk.X)
-
-        tk.Label(header, text="\U0001f916  Claude Code Usage",
-                 font=("sans-serif", 12, "bold"),
-                 bg=THEME["surface"], fg=THEME["text"]).pack(side=tk.LEFT)
-
+    def _update_status(self, data):
         status = (data or {}).get("status", "unknown")
-        status_color = THEME["green"] if status == "allowed" else THEME["red"]
-        status_text = "\u25cf " + status.upper()
-        tk.Label(header, text=status_text, font=("sans-serif", 9),
-                 bg=THEME["surface"], fg=status_color).pack(side=tk.RIGHT)
+        color = THEME["green"] if status == "allowed" else THEME["red"]
+        self._status_label.config(text="● " + status.upper(), fg=color)
 
-        # Body
-        body = tk.Frame(container, bg=THEME["bg"], padx=16, pady=12)
-        body.pack(fill=tk.X)
+    def _update_time(self, data):
+        fetched = ""
+        if data and "fetched_at" in data:
+            try:
+                ft = datetime.fromisoformat(data["fetched_at"])
+                fetched = ft.strftime("%H:%M:%S")
+            except ValueError:
+                pass
+        self._time_label.config(text=fetched)
+
+    def _fill_body(self, body, data):
+        """Fill body frame with data widgets."""
+        # Clear existing content
+        for w in body.winfo_children():
+            w.destroy()
 
         if not data or "error" in data:
             err_msg = (data or {}).get("error", "No data yet")
-            tk.Label(body, text=f"\u26a0  {err_msg}",
+            tk.Label(body, text=f"! {err_msg}",
                      font=("sans-serif", 10), bg=THEME["bg"],
                      fg=THEME["orange"], wraplength=280,
                      justify=tk.LEFT).pack(anchor=tk.W)
@@ -324,7 +298,6 @@ class DropdownPanel:
                 is_rep = (wid == rep)
 
                 if i > 0:
-                    # Separator
                     tk.Frame(body, bg=THEME["surface2"],
                              height=1).pack(fill=tk.X, pady=8)
 
@@ -345,18 +318,16 @@ class DropdownPanel:
                          fg=self._color_for_percent(pct)).pack(
                     side=tk.RIGHT, anchor=tk.E)
 
-                # Progress bar
                 bar_frame = tk.Frame(body, bg=THEME["surface"],
                                      height=10, padx=0, pady=0)
                 bar_frame.pack(fill=tk.X, pady=(4, 0))
                 bar_frame.pack_propagate(False)
 
                 bar_color = self._color_for_percent(pct)
-                fill_width = max(util, 0.02)  # min visible
+                fill_width = max(util, 0.02)
                 bar_fill = tk.Frame(bar_frame, bg=bar_color)
                 bar_fill.place(relwidth=fill_width, relheight=1.0)
 
-                # Reset time
                 reset_text = f"Resets in {format_reset(w.get('reset', ''))}"
                 w_status = w.get("status", "")
                 if w_status and w_status != "allowed":
@@ -367,7 +338,6 @@ class DropdownPanel:
                          bg=THEME["bg"], fg=THEME["subtext"]).pack(
                     anchor=tk.W, pady=(2, 0))
 
-            # Overage info
             overage = data.get("overage_status", "")
             if overage and overage != "allowed":
                 tk.Frame(body, bg=THEME["surface2"],
@@ -381,31 +351,114 @@ class DropdownPanel:
                          bg=THEME["bg"], fg=THEME["subtext"]).pack(
                     anchor=tk.W)
 
+        return body
+
+    def show(self, data: dict | None, pos: tuple | None = None):
+        with self._lock:
+            if self._win is not None:
+                try:
+                    self._win.destroy()
+                except tk.TclError:
+                    pass
+                self._win = None
+
+        win = tk.Tk()
+        self._win = win
+        win.title("")
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=THEME["border"])
+
+        if pos:
+            mx, my = pos
+        else:
+            mx, my = win.winfo_pointerx(), win.winfo_pointery()
+
+        outer = tk.Frame(win, bg=THEME["border"], padx=1, pady=1)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        container = tk.Frame(outer, bg=THEME["bg"], padx=0, pady=0)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        # Header
+        header = tk.Frame(container, bg=THEME["surface"], padx=16, pady=10)
+        header.pack(fill=tk.X)
+
+        tk.Label(header, text="Claude Code Usage",
+                 font=("sans-serif", 12, "bold"),
+                 bg=THEME["surface"], fg=THEME["text"]).pack(side=tk.LEFT)
+
+        self._status_label = tk.Label(header, text="", font=("sans-serif", 9),
+                                      bg=THEME["surface"])
+        self._status_label.pack(side=tk.RIGHT)
+        self._update_status(data)
+
+        # Body (replaceable)
+        self._container = container
+        self._body = tk.Frame(container, bg=THEME["bg"], padx=16, pady=12)
+        self._body.pack(fill=tk.X)
+        self._fill_body(self._body, data)
+
         # Footer
         footer = tk.Frame(container, bg=THEME["surface"], padx=16, pady=8)
         footer.pack(fill=tk.X, side=tk.BOTTOM)
 
-        fetched = ""
-        if data and "fetched_at" in data:
-            try:
-                ft = datetime.fromisoformat(data["fetched_at"])
-                fetched = ft.strftime("%H:%M:%S")
-            except ValueError:
-                pass
+        self._time_label = tk.Label(footer, text="",
+                                    font=("sans-serif", 8),
+                                    bg=THEME["surface"], fg=THEME["subtext"])
+        self._time_label.pack(side=tk.LEFT)
+        self._update_time(data)
 
-        tk.Label(footer, text=f"\U0001f552  {fetched}" if fetched else "",
-                 font=("sans-serif", 8),
-                 bg=THEME["surface"], fg=THEME["subtext"]).pack(side=tk.LEFT)
+        # Button bar
+        btn_frame = tk.Frame(footer, bg=THEME["surface"])
+        btn_frame.pack(side=tk.RIGHT)
+
+        refresh_btn = tk.Label(btn_frame, text=" Refresh ",
+                               font=("sans-serif", 10, "bold"),
+                               bg=THEME["blue"], fg="#1e1e2e",
+                               cursor="hand2", padx=6, pady=2)
+        refresh_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        def do_refresh(e=None):
+            self._refreshing = True
+            refresh_btn.config(text=" ... ", bg=THEME["surface2"])
+            win.update()
+
+            def _run_refresh():
+                token = get_token()
+                if token:
+                    new_data = fetch_usage(token)
+                    if "error" not in new_data:
+                        save_cache(new_data)
+                    Path("/tmp/.claude-monitor-refresh").touch()
+                    win.after(0, lambda: _update_ui(new_data))
+                else:
+                    win.after(0, lambda: _done_refresh())
+
+            def _done_refresh():
+                refresh_btn.config(text=" Refresh ", bg=THEME["blue"])
+                self._refreshing = False
+                win.focus_force()
+
+            def _update_ui(new_data):
+                self._fill_body(self._body, new_data)
+                self._update_status(new_data)
+                self._update_time(new_data)
+                _done_refresh()
+                win.update_idletasks()
+
+            threading.Thread(target=_run_refresh, daemon=True).start()
+
+        refresh_btn.bind("<Button-1>", do_refresh)
 
         # Quit button - kills the main monitor process
-        quit_btn = tk.Label(footer, text="  Quit  ",
+        quit_btn = tk.Label(btn_frame, text="  Quit  ",
                             font=("sans-serif", 10, "bold"),
                             bg=THEME["red"], fg="#1e1e2e",
-                            cursor="hand2", padx=8, pady=2)
-        quit_btn.pack(side=tk.RIGHT)
+                            cursor="hand2", padx=6, pady=2)
+        quit_btn.pack(side=tk.LEFT)
 
         def quit_monitor(e=None):
-            # Kill all monitor.py processes except this panel
             import os as _os
             my_pid = _os.getpid()
             try:
@@ -444,45 +497,47 @@ class DropdownPanel:
 
         win.bind("<FocusOut>", on_focus_out)
         win.bind("<Escape>", on_escape)
-        win.bind("<Button-1>", lambda e: win.after(200, self._close))
 
-        # Poll: close when mouse clicks outside the window
+
+        self._refreshing = False
+
+        # Poll mouse button state to detect outside clicks
         def check_outside():
             try:
                 if not win.winfo_exists():
                     return
-                # Check if our window still has focus
-                try:
-                    focused = win.focus_get()
-                except KeyError:
-                    focused = None
-                if focused is None:
-                    self._close()
+                if self._refreshing:
+                    win.after(150, check_outside)
                     return
-                win.after(200, check_outside)
+                from Xlib import display as xdisplay
+                d = xdisplay.Display()
+                qp = d.screen().root.query_pointer()
+                d.close()
+                # Check if any button is pressed
+                buttons_pressed = qp.mask & 0x1F00  # Button1-5 mask
+                if buttons_pressed:
+                    mx, my = qp.root_x, qp.root_y
+                    wx = win.winfo_rootx()
+                    wy = win.winfo_rooty()
+                    ww = win.winfo_width()
+                    wh = win.winfo_height()
+                    inside = wx <= mx <= wx + ww and wy <= my <= wy + wh
+                    if not inside:
+                        self._close()
+                        return
+                win.after(100, check_outside)
             except tk.TclError:
                 pass
+            except Exception:
+                win.after(200, check_outside)
 
-        # Grab all input so clicks outside dismiss the window
         win.focus_force()
-        win.after(100, lambda: self._grab(win))
         win.after(500, check_outside)
         win.mainloop()
-
-    def _grab(self, win):
-        """Grab pointer so clicking outside closes the panel."""
-        try:
-            win.grab_set_global()
-        except tk.TclError:
-            pass
 
     def _close(self):
         with self._lock:
             if self._win:
-                try:
-                    self._win.grab_release()
-                except tk.TclError:
-                    pass
                 try:
                     self._win.destroy()
                 except tk.TclError:
@@ -539,6 +594,11 @@ class UsageMonitor:
             return
         self._anim_frame = (self._anim_frame + 1) % 12
         self._update_icon()
+        # Check for refresh trigger from panel
+        trigger = Path("/tmp/.claude-monitor-refresh")
+        if trigger.exists():
+            trigger.unlink(missing_ok=True)
+            threading.Thread(target=self.refresh, daemon=True).start()
         self._anim_timer = threading.Timer(2.0, self._animate)
         self._anim_timer.daemon = True
         self._anim_timer.start()

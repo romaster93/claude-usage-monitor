@@ -47,9 +47,9 @@ python3 monitor.py
 
 ## Usage
 
-- **Left-click** the tray icon to toggle the detail panel
-- **Right-click** for menu (Show Details / Refresh Now / Quit)
+- **Click** the tray icon to toggle the detail panel
 - Click outside the panel or press **Escape** to close it
+- Use **Refresh** / **Quit** buttons in the panel footer
 - The icon auto-starts on login after installation
 
 ## Detail Panel
