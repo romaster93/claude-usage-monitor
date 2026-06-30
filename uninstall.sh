@@ -22,15 +22,5 @@ if [ -d "$CONFIG_DIR" ]; then
     fi
 fi
 
-# Remove keyring entry
-python3 -c "
-import keyring
-try:
-    keyring.delete_password('claude-usage-monitor', 'anthropic-api-key')
-    print('[OK] Removed stored API key from keyring')
-except:
-    print('[OK] No stored API key found')
-" 2>/dev/null
-
 echo ""
 echo "Uninstall complete. You can safely delete this directory."

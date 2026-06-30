@@ -21,9 +21,13 @@ The monitor reads your OAuth token from `~/.claude/.credentials.json` (created w
 
 ## Requirements
 
-- Ubuntu / Linux with X11
+- Ubuntu / Linux (X11; Wayland may work but is untested)
 - Python 3.10+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and logged in
+- System tray backend: on Debian/Ubuntu install `python3-gi`, `gir1.2-gtk-3.0`,
+  `gir1.2-ayatanaappindicator3-0.1` (the installer does this for you). On vanilla
+  GNOME, also enable the "AppIndicator and KStatusNotifierItem Support" extension —
+  Ubuntu ships it enabled by default. Without these the tray icon may not appear.
 
 ## Installation
 
@@ -34,7 +38,7 @@ cd claude-usage-monitor
 ```
 
 This will:
-1. Install Python dependencies (`pystray`, `Pillow`, `keyring`)
+1. Install Python dependencies (`pystray`, `Pillow`)
 2. Create a desktop autostart entry (starts on login)
 3. Create an application launcher
 
