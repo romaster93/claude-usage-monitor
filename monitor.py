@@ -24,17 +24,67 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "claude-usage-monitor"
 CONFIG_DIR = Path.home() / ".config" / APP_NAME
-CACHE_FILE = CONFIG_DIR / "usage_cache.json"
 CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+GROK_LOG_FILE = Path.home() / ".grok" / "logs" / "unified.jsonl"
+
+PROBE_MODEL = "claude-haiku-4-5-20251001"
+
+# ── Providers ────────────────────────────────────────────────────
+#
+# Each provider runs as its own process with its own tray icon, cache, lock
+# and refresh trigger, so one provider failing can never take down another.
+#
+# "claude" probes the API live. "codex" and "grok" have no queryable usage
+# endpoint, so they read the numbers their own CLI already wrote to disk:
+# that costs nothing and needs no credentials, but the value only advances
+# when you actually run that CLI — hence `local: True`, which makes the panel
+# label the reading with its age instead of implying it is live.
+PROVIDERS = {
+    "claude": {
+        "label": "Claude Code",
+        "accent": (255, 150, 60),
+        "interval": 300,
+        "local": False,
+    },
+    "codex": {
+        "label": "Codex",
+        "accent": (120, 220, 160),
+        "interval": 60,
+        "local": True,
+        "hint": "No usage recorded yet - run `codex` once.",
+    },
+    "grok": {
+        "label": "Grok",
+        "accent": (110, 170, 255),
+        "interval": 60,
+        "local": True,
+        "hint": "No usage recorded yet - run `grok` once.",
+    },
+}
+DEFAULT_PROVIDER = "claude"
+
+# Set by select_provider() before anything touches the paths below. Each
+# provider gets distinct files so three concurrent processes never collide.
+PROVIDER = DEFAULT_PROVIDER
+CACHE_FILE = CONFIG_DIR / f"usage_cache_{PROVIDER}.json"
 # Per-user IPC trigger: the panel subprocess touches this to ask the main
 # process to reload the cache. Kept under CONFIG_DIR (not world-writable /tmp).
-REFRESH_TRIGGER = CONFIG_DIR / "refresh.trigger"
+REFRESH_TRIGGER = CONFIG_DIR / f"refresh_{PROVIDER}.trigger"
 # Single-instance lock: holds the PID of the running tray monitor so that
 # autostart + a manual launcher click don't create duplicate tray icons.
-LOCK_FILE = CONFIG_DIR / "monitor.pid"
+LOCK_FILE = CONFIG_DIR / f"monitor_{PROVIDER}.pid"
+REFRESH_INTERVAL = PROVIDERS[PROVIDER]["interval"]
 
-REFRESH_INTERVAL = 300
-PROBE_MODEL = "claude-haiku-4-5-20251001"
+
+def select_provider(provider: str):
+    """Point every per-provider path at `provider`. Call once, at startup."""
+    global PROVIDER, CACHE_FILE, REFRESH_TRIGGER, LOCK_FILE, REFRESH_INTERVAL
+    PROVIDER = provider
+    CACHE_FILE = CONFIG_DIR / f"usage_cache_{provider}.json"
+    REFRESH_TRIGGER = CONFIG_DIR / f"refresh_{provider}.trigger"
+    LOCK_FILE = CONFIG_DIR / f"monitor_{provider}.pid"
+    REFRESH_INTERVAL = PROVIDERS[provider]["interval"]
 
 # ── Theme ────────────────────────────────────────────────────────
 
@@ -57,8 +107,18 @@ THEME = {
 
 # ── Usage windows ────────────────────────────────────────────────
 
-WINDOW_LABELS = {"5h": "5 Hours", "7d": "7 Days", "24h": "24 Hours", "1h": "1 Hour"}
-WINDOW_ORDER = tuple(WINDOW_LABELS)  # ("5h", "7d", "24h", "1h")
+WINDOW_LABELS = {"5h": "5 Hours", "7d": "7 Days", "24h": "24 Hours",
+                 "1h": "1 Hour", "30d": "30 Days"}
+WINDOW_ORDER = tuple(WINDOW_LABELS)  # ("5h", "7d", "24h", "1h", "30d")
+
+# Codex reports its window as a raw minute count; Grok as a period enum.
+# Both map onto the same window ids the Claude headers use.
+_MINUTES_TO_WINDOW = {60: "1h", 300: "5h", 1440: "24h", 10080: "7d", 43200: "30d"}
+_GROK_PERIOD_TO_WINDOW = {
+    "USAGE_PERIOD_TYPE_WEEKLY": "7d",
+    "USAGE_PERIOD_TYPE_MONTHLY": "30d",
+    "USAGE_PERIOD_TYPE_DAILY": "24h",
+}
 
 _REP_ALIASES = {"five_hour": "5h", "seven_day": "7d"}
 
@@ -193,6 +253,196 @@ def parse_unified_limits(headers: dict) -> dict:
     return data
 
 
+# ── Local providers (Codex / Grok) ───────────────────────────────
+#
+# Neither CLI offers a headless "show my usage" command, but both already
+# write the figure their own UI displays into a file under $HOME. We read
+# that file. No network, no credentials, no quota spent — at the cost of the
+# reading being only as fresh as the last time you ran that CLI.
+
+def _derived_status(pct: float) -> str:
+    """Local sources carry no server status field, so derive one from usage."""
+    return "allowed" if pct < 90 else "allowed_warning"
+
+
+def _tail_lines(path: Path, max_bytes: int = 512 * 1024) -> list[str]:
+    """Read the last `max_bytes` of a file as lines, newest last.
+
+    These logs grow without bound, so never read the whole thing. A partial
+    first line (from cutting mid-record) is dropped by the caller's JSON
+    parse, which is why the slice boundary needs no special handling.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            start = max(0, f.tell() - max_bytes)
+            f.seek(start)
+            blob = f.read()
+    except OSError:
+        return []
+    return blob.decode("utf-8", errors="replace").splitlines()
+
+
+def fetch_codex_usage() -> dict:
+    """Latest rate limits Codex recorded in its session rollout logs.
+
+    Codex appends a `token_count` event carrying `rate_limits` after each
+    turn. The newest rollout file holds the newest figure, so walk files by
+    mtime and take the last matching record from the first file that has one.
+    """
+    try:
+        files = sorted(CODEX_SESSIONS_DIR.glob("**/rollout-*.jsonl"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return {"error": "Cannot read ~/.codex/sessions"}
+    if not files:
+        return {"error": PROVIDERS["codex"]["hint"]}
+
+    for path in files[:10]:   # bound the scan; older files cannot be newer
+        record = None
+        for line in _tail_lines(path):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue      # truncated first line, or a non-JSON line
+            payload = obj.get("payload") or {}
+            if payload.get("rate_limits"):
+                record = obj
+        if record:
+            return _parse_codex_record(record)
+
+    return {"error": PROVIDERS["codex"]["hint"]}
+
+
+def _parse_codex_record(record: dict) -> dict:
+    limits = record["payload"]["rate_limits"]
+    data = {
+        "fetched_at": _iso_or_now(record.get("timestamp")),
+        "representative_claim": "",
+        "plan": limits.get("plan_type") or "",
+        "windows": {},
+    }
+
+    worst = 0.0
+    # `primary`/`secondary` are positional, not semantic: which real window
+    # each holds varies by plan, so key them by their own window_minutes.
+    for slot in ("primary", "secondary"):
+        window = limits.get(slot)
+        if not window:
+            continue
+        try:
+            pct = float(window["used_percent"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        minutes = window.get("window_minutes")
+        wid = _MINUTES_TO_WINDOW.get(minutes)
+        if wid is None:
+            continue   # an unmapped window has no label or ordering slot
+        data["windows"][wid] = {
+            "utilization": str(pct / 100.0),
+            "reset": str(window.get("resets_at", "")),
+            "status": _derived_status(pct),
+        }
+        worst = max(worst, pct)
+        if not data["representative_claim"]:
+            data["representative_claim"] = wid
+
+    if not data["windows"]:
+        return {"error": "Codex reported no usable rate limit window"}
+    data["status"] = _derived_status(worst)
+    return data
+
+
+def fetch_grok_usage() -> dict:
+    """Latest weekly usage Grok recorded in its unified log.
+
+    Grok logs `billing: fetched credits config` whenever it refreshes billing
+    (session start, and on /usage). The record carries the same
+    `creditUsagePercent` its /usage screen shows.
+    """
+    if not GROK_LOG_FILE.exists():
+        return {"error": PROVIDERS["grok"]["hint"]}
+
+    record = None
+    for line in _tail_lines(GROK_LOG_FILE):
+        if "fetched credits config" not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ((obj.get("ctx") or {}).get("config")):
+            record = obj
+    if record is None:
+        return {"error": PROVIDERS["grok"]["hint"]}
+
+    ctx = record["ctx"]
+    config = ctx["config"]
+    try:
+        pct = float(config["creditUsagePercent"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "Grok reported no usage percentage"}
+
+    period = config.get("currentPeriod") or {}
+    wid = _GROK_PERIOD_TO_WINDOW.get(period.get("type"), "7d")
+
+    data = {
+        "fetched_at": _iso_or_now(record.get("ts")),
+        "status": _derived_status(pct),
+        "representative_claim": wid,
+        "plan": ctx.get("subscriptionTier") or "",
+        "windows": {
+            wid: {
+                "utilization": str(pct / 100.0),
+                "reset": period.get("end", ""),
+                "status": _derived_status(pct),
+            }
+        },
+    }
+
+    # Pay-as-you-go top-up, shown only once it is actually in play.
+    used, cap = _grok_val(config, "onDemandUsed"), _grok_val(config, "onDemandCap")
+    if cap or used:
+        data["extra"] = f"On-demand: {used:g} / {cap:g}"
+    return data
+
+
+def _grok_val(config: dict, key: str) -> float:
+    """Grok wraps numbers as {"val": n}; absent keys mean zero."""
+    raw = config.get(key)
+    if isinstance(raw, dict):
+        raw = raw.get("val")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _iso_or_now(value) -> str:
+    """Normalize a logged timestamp to ISO-8601, falling back to now."""
+    if isinstance(value, str) and value:
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc).isoformat()
+
+
+def fetch_for_provider(provider: str) -> dict | None:
+    """Fetch usage for `provider`. None means "cannot even try" (no login)."""
+    if provider == "codex":
+        return fetch_codex_usage()
+    if provider == "grok":
+        return fetch_grok_usage()
+    token = get_token()
+    if not token:
+        return None
+    return fetch_usage(token)
+
+
 # ── Icon ─────────────────────────────────────────────────────────
 
 def get_primary_percent(data: dict | None) -> int | None:
@@ -213,11 +463,18 @@ def _color_for_pct(pct: int) -> tuple:
     return ICON_COLORS[usage_level(pct)]
 
 
-def make_icon(percent: int | None, error: bool = False) -> Image.Image:
-    """Big bold number, rendered at 4x then downscaled for clean result."""
+def make_icon(percent: int | None, error: bool = False,
+              accent: tuple | None = None) -> Image.Image:
+    """Big bold number, rendered at 4x then downscaled for clean result.
+
+    `accent` paints a thin bar along the bottom edge. With one tray icon per
+    provider the bare number is ambiguous, and the bar identifies the source
+    without stealing width from the digits.
+    """
     OUT = 24
     SCALE = 4
     R = OUT * SCALE  # render size
+    BAR = 3 * SCALE
     img = Image.new("RGBA", (R, R), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
@@ -250,8 +507,10 @@ def make_icon(percent: int | None, error: bool = False) -> Image.Image:
 
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    # Centre the digits in the space above the accent bar, not the whole tile,
+    # so adding the bar doesn't push the number off-centre.
     x = (R - tw) // 2
-    y = (R - th) // 2
+    y = (R - BAR - th) // 2
 
     # Clean black outline at 4x (becomes smooth after downscale)
     for dx in range(-3, 4):
@@ -262,10 +521,32 @@ def make_icon(percent: int | None, error: bool = False) -> Image.Image:
 
     draw.text((x, y), text, fill=color, font=font)
 
+    if accent:
+        draw.rectangle([0, R - BAR, R - 1, R - 1], fill=(*accent, 255))
+
     return img.resize((OUT, OUT), Image.LANCZOS)
 
 
 # ── Dropdown Panel ───────────────────────────────────────────────
+
+def age_seconds(when: datetime) -> int:
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - when).total_seconds()))
+
+
+def format_age(total_sec: int) -> str:
+    days, rem = divmod(total_sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    if minutes > 0:
+        return f"{minutes}m"
+    return "<1m"
+
 
 def format_reset(reset_val: str) -> str:
     if not reset_val:
@@ -307,14 +588,26 @@ class DropdownPanel:
         self._status_label.config(text="● " + status.upper(), fg=color)
 
     def _update_time(self, data):
-        fetched = ""
+        fetched, age = "", None
         if data and "fetched_at" in data:
             try:
                 ft = datetime.fromisoformat(data["fetched_at"])
-                fetched = ft.strftime("%H:%M:%S")
             except ValueError:
-                pass
-        self._time_label.config(text=fetched)
+                ft = None
+            if ft is not None:
+                fetched = ft.astimezone().strftime("%H:%M:%S")
+                age = age_seconds(ft)
+
+        is_local = PROVIDERS[PROVIDER]["local"]
+        color = THEME["subtext"]
+        # For a local provider the number only moves when that CLI runs, so an
+        # unqualified clock time would read as "live". Always state the age,
+        # and flag it once the reading is old enough to be misleading.
+        if age is not None and (is_local or age > 600):
+            fetched += f"  ({format_age(age)} ago)"
+            if is_local and age > 3600:
+                color = THEME["orange"]
+        self._time_label.config(text=fetched, fg=color)
 
     def _fill_body(self, body, data):
         """Fill body frame with data widgets."""
@@ -332,7 +625,8 @@ class DropdownPanel:
             windows = data.get("windows", {})
             rep = normalize_rep(data.get("representative_claim", ""))
 
-            for i, wid in enumerate(WINDOW_ORDER):
+            rendered = 0
+            for wid in WINDOW_ORDER:
                 if wid not in windows:
                     continue
                 w = windows[wid]
@@ -343,9 +637,14 @@ class DropdownPanel:
                 pct = int(util * 100)
                 is_rep = (wid == rep)
 
-                if i > 0:
+                # Separate rows from each other — count what was actually
+                # drawn, not the position in WINDOW_ORDER. A provider whose
+                # only window sorts late (Codex/Grok have just "7d") would
+                # otherwise get a stray rule above its first row.
+                if rendered:
                     tk.Frame(body, bg=THEME["surface2"],
                              height=1).pack(fill=tk.X, pady=8)
+                rendered += 1
 
                 row = tk.Frame(body, bg=THEME["bg"])
                 row.pack(fill=tk.X)
@@ -383,6 +682,14 @@ class DropdownPanel:
                          font=("sans-serif", 9),
                          bg=THEME["bg"], fg=THEME["subtext"]).pack(
                     anchor=tk.W, pady=(2, 0))
+
+            extra = data.get("extra", "")
+            if extra:
+                tk.Frame(body, bg=THEME["surface2"],
+                         height=1).pack(fill=tk.X, pady=8)
+                tk.Label(body, text=extra,
+                         font=("sans-serif", 9),
+                         bg=THEME["bg"], fg=THEME["subtext"]).pack(anchor=tk.W)
 
             overage = data.get("overage_status", "")
             if overage and overage != "allowed":
@@ -433,7 +740,11 @@ class DropdownPanel:
         header = tk.Frame(container, bg=THEME["surface"], padx=16, pady=10)
         header.pack(fill=tk.X)
 
-        tk.Label(header, text="Claude Code Usage",
+        title = PROVIDERS[PROVIDER]["label"]
+        plan = (data or {}).get("plan", "")
+        if plan:
+            title += f"  ({plan})"
+        tk.Label(header, text=title,
                  font=("sans-serif", 12, "bold"),
                  bg=THEME["surface"], fg=THEME["text"]).pack(side=tk.LEFT)
 
@@ -473,19 +784,16 @@ class DropdownPanel:
         result_q: queue.Queue = queue.Queue()
 
         def _run_refresh():
-            token = get_token()
-            new_data = None
-            if token:
-                new_data = fetch_usage(token)
-                if "error" not in new_data:
-                    save_cache(new_data)
-                    # Cache changed — ask the main process to reload it.
-                    try:
-                        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                        REFRESH_TRIGGER.touch()
-                    except OSError:
-                        pass
-            result_q.put(new_data)  # None means "no token"
+            new_data = fetch_for_provider(PROVIDER)
+            if new_data is not None and "error" not in new_data:
+                save_cache(new_data)
+                # Cache changed — ask the main process to reload it.
+                try:
+                    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                    REFRESH_TRIGGER.touch()
+                except OSError:
+                    pass
+            result_q.put(new_data)  # None means "not logged in"
 
         def _done_refresh():
             if not win.winfo_exists():
@@ -647,13 +955,12 @@ class UsageMonitor:
         if not self._refresh_inflight.acquire(blocking=False):
             return
         try:
-            token = get_token()
-            if not token:
+            data = fetch_for_provider(PROVIDER)
+            if data is None:
                 self.usage_data = {"error": "Claude Code not logged in"}
                 self._update_icon()
                 return
 
-            data = fetch_usage(token)
             with self._lock:
                 self.usage_data = data
                 if "error" not in data:
@@ -668,13 +975,23 @@ class UsageMonitor:
         data = self.usage_data  # single atomic read for a consistent snapshot
         has_error = bool(data and "error" in data)
         pct = get_primary_percent(data)
-        self.icon.icon = make_icon(pct, error=has_error)
+        spec = PROVIDERS[PROVIDER]
+        self.icon.icon = make_icon(pct, error=has_error, accent=spec["accent"])
         if has_error:
-            self.icon.title = "Claude Usage: Error"
+            self.icon.title = f"{spec['label']}: {data['error']}"
         elif pct is not None:
-            self.icon.title = f"Claude Code: {pct}%"
+            title = f"{spec['label']}: {pct}%"
+            # The tooltip is the only place a stale local reading can be
+            # called out without opening the panel.
+            if spec["local"] and data and "fetched_at" in data:
+                try:
+                    when = datetime.fromisoformat(data["fetched_at"])
+                    title += f"  ({format_age(age_seconds(when))} ago)"
+                except ValueError:
+                    pass
+            self.icon.title = title
         else:
-            self.icon.title = "Claude Usage Monitor"
+            self.icon.title = f"{spec['label']} Usage Monitor"
 
     def _poll_trigger(self):
         """Every 2s, reload the cache if the panel signalled a refresh.
@@ -734,7 +1051,7 @@ class UsageMonitor:
         data_json = json.dumps(self.usage_data or {})
         self._panel_proc = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__),
-             "--panel", data_json, str(os.getpid())],
+             "--panel", data_json, str(os.getpid()), PROVIDER],
             start_new_session=True,
         )
 
@@ -817,18 +1134,23 @@ class UsageMonitor:
         win.mainloop()
 
     def run(self):
-        token = get_token()
-        if not token:
+        spec = PROVIDERS[PROVIDER]
+        # Only the Claude provider needs credentials, and only it can be so
+        # broken at startup that there is nothing to show. Codex and Grok read
+        # files that simply may not exist yet, which the panel reports as a
+        # hint rather than a fatal error — their tray icon still comes up.
+        if not spec["local"] and not get_token():
             self._show_login_guide()
             sys.exit(1)
 
         self.refresh()
 
         self.icon = pystray.Icon(
-            name=APP_NAME,
+            name=f"{APP_NAME}-{PROVIDER}",
             icon=make_icon(get_primary_percent(self.usage_data),
-                           error=bool(self.usage_data and "error" in self.usage_data)),
-            title="Claude Code Usage Monitor",
+                           error=bool(self.usage_data and "error" in self.usage_data),
+                           accent=spec["accent"]),
+            title=f"{spec['label']} Usage Monitor",
             menu=pystray.Menu(
                 pystray.MenuItem("Show Details", self.on_details, default=True),
                 pystray.Menu.SEPARATOR,
@@ -898,11 +1220,30 @@ def main():
                 parent_pid = int(sys.argv[3])
             except ValueError:
                 pass
+        if len(sys.argv) >= 5 and sys.argv[4] in PROVIDERS:
+            select_provider(sys.argv[4])
         DropdownPanel().show(data, parent_pid=parent_pid)
         return
 
+    provider = DEFAULT_PROVIDER
+    args = sys.argv[1:]
+    if args:
+        if args[0] == "--provider" and len(args) >= 2:
+            provider = args[1]
+        elif args[0].startswith("--provider="):
+            provider = args[0].split("=", 1)[1]
+        else:
+            print(f"Usage: {sys.argv[0]} [--provider "
+                  f"{'|'.join(PROVIDERS)}]", file=sys.stderr)
+            sys.exit(2)
+        if provider not in PROVIDERS:
+            print(f"Unknown provider '{provider}' "
+                  f"(expected one of: {', '.join(PROVIDERS)})", file=sys.stderr)
+            sys.exit(2)
+    select_provider(provider)
+
     if not acquire_single_instance():
-        print("claude-usage-monitor is already running.", file=sys.stderr)
+        print(f"{APP_NAME} ({provider}) is already running.", file=sys.stderr)
         return
 
     UsageMonitor().run()

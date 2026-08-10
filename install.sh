@@ -64,40 +64,57 @@ else
     echo "[WARN] icon.png not found - using generic system icon"
 fi
 
-# Create desktop autostart entry
+# Desktop entries: one tray icon per provider, each its own process.
+#
+# Claude always gets entries. Codex and Grok read usage out of their own CLI's
+# files, so an entry for a CLI that isn't installed would only ever show an
+# error — install those two only when their config directory exists.
 AUTOSTART_DIR="$HOME/.config/autostart"
-mkdir -p "$AUTOSTART_DIR"
-cat > "$AUTOSTART_DIR/$APP_NAME.desktop" << EOF
+LAUNCHER_DIR="$HOME/.local/share/applications"
+mkdir -p "$AUTOSTART_DIR" "$LAUNCHER_DIR"
+
+write_entries() {
+    provider="$1"; label="$2"
+    for target in "$AUTOSTART_DIR" "$LAUNCHER_DIR"; do
+        entry="$target/$APP_NAME-$provider.desktop"
+        cat > "$entry" << EOF
 [Desktop Entry]
 Type=Application
-Name=Claude Usage Monitor
-Comment=Monitor Claude Code usage in system tray
-Exec="$PYTHON" "$MONITOR_PY"
+Name=$label Usage Monitor
+Comment=Monitor $label usage in system tray
+Exec="$PYTHON" "$MONITOR_PY" --provider $provider
 Icon=$ICON_DEST
 Terminal=false
 Hidden=false
 X-GNOME-Autostart-enabled=true
-StartupNotify=false
-EOF
-
-echo "[OK] Autostart entry created"
-
-# Create .desktop launcher
-LAUNCHER_DIR="$HOME/.local/share/applications"
-mkdir -p "$LAUNCHER_DIR"
-cat > "$LAUNCHER_DIR/$APP_NAME.desktop" << EOF
-[Desktop Entry]
-Type=Application
-Name=Claude Usage Monitor
-Comment=Monitor Claude Code usage in system tray
-Exec="$PYTHON" "$MONITOR_PY"
-Icon=$ICON_DEST
-Terminal=false
 Categories=Utility;Monitor;
 StartupNotify=false
 EOF
+    done
+    echo "[OK] $label entries created (autostart + launcher)"
+}
 
-echo "[OK] Application launcher created"
+# Drop pre-provider entries so an upgrade doesn't leave a duplicate Claude
+# icon behind from the old single-process layout.
+rm -f "$AUTOSTART_DIR/$APP_NAME.desktop" "$LAUNCHER_DIR/$APP_NAME.desktop"
+
+write_entries claude "Claude Code"
+
+if [ -d "$HOME/.codex" ]; then
+    write_entries codex "Codex"
+else
+    rm -f "$AUTOSTART_DIR/$APP_NAME-codex.desktop" \
+          "$LAUNCHER_DIR/$APP_NAME-codex.desktop"
+    echo "[--] Codex not detected (~/.codex missing) - skipped"
+fi
+
+if [ -d "$HOME/.grok" ]; then
+    write_entries grok "Grok"
+else
+    rm -f "$AUTOSTART_DIR/$APP_NAME-grok.desktop" \
+          "$LAUNCHER_DIR/$APP_NAME-grok.desktop"
+    echo "[--] Grok not detected (~/.grok missing) - skipped"
+fi
 
 # Refresh the application database so the launcher shows up immediately
 if command -v update-desktop-database >/dev/null 2>&1; then
@@ -120,8 +137,14 @@ echo ""
 echo "Installation complete!"
 echo ""
 echo "Usage:"
-echo "  Start now:    python3 $MONITOR_PY"
-echo "  Auto-starts on login"
+echo "  Start now:    python3 $MONITOR_PY --provider claude"
+echo "                python3 $MONITOR_PY --provider codex"
+echo "                python3 $MONITOR_PY --provider grok"
+echo "  Auto-starts on login (one tray icon per installed provider)"
+echo ""
+echo "Codex and Grok usage is read from the files those CLIs write, so their"
+echo "numbers only advance when you actually run them; the panel states the"
+echo "age of each reading."
 echo ""
 echo "Reads credentials from ~/.claude/.credentials.json automatically."
 echo "Just make sure you're logged into Claude Code."
