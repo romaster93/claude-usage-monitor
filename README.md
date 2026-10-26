@@ -14,8 +14,10 @@ plus Codex, Grok and Antigravity (agy) usage when those CLIs are installed.
   its color-coded usage number, so you can tell them apart without clicking
 - **One combined panel**: clicking any of the icons opens a single panel with a
   section per provider (Claude, Codex, Grok, Antigravity)
-- **Auto-refresh** every 5 minutes (Claude); Codex, Grok and agy re-read their
-  local files every minute
+- **Auto-refresh**: Claude every 5 minutes; Codex every minute, live from
+  `codex app-server` (`account/rateLimits/read`, a read that spends no quota),
+  falling back to its session logs; Grok and agy within ~2 seconds of their CLI
+  rewriting its usage file
 - **Zero configuration** - reads credentials directly from Claude Code
 - Color-coded usage levels: green (<40%), yellow (<70%), orange (<90%), red (>=90%)
 - Catppuccin-themed detail panel with progress bars and reset timers
@@ -69,8 +71,10 @@ The panel shows one section per provider that is installed (it has a usage
 cache or a running tray monitor). Each section has:
 - The provider's pixel brand mark, name and plan
 - Current rate limit status
-- When the reading was taken; for Codex, Grok and agy (which only update when
-  you run that CLI) the age is always shown, in orange once it is over an hour old
+- When the reading was taken; for Codex, Grok and agy the age is always shown,
+  in orange once it is over an hour old. Grok and agy only update while you run
+  that CLI (agy: while its statusLine is redrawn); Codex does too if its live
+  query fails and the session-log fallback is used
 - One compact row per usage window: utilization %, progress bar and reset countdown
 
 ## Uninstall

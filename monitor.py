@@ -14,6 +14,8 @@ import json
 import math
 import os
 import queue
+import selectors
+import shutil
 import signal
 import subprocess
 import sys
@@ -46,11 +48,14 @@ PROBE_MODEL = "claude-haiku-4-5-20251001"
 # and refresh trigger, so one provider failing can never take down another.
 # Only the panel is shared: it reads every provider's cache itself.
 #
-# "claude" probes the API live. "codex", "grok" and "agy" have no queryable usage
-# endpoint, so they read the numbers their own CLI already wrote to disk:
-# that costs nothing and needs no credentials, but the value only advances
-# when you actually run that CLI — hence `local: True`, which makes the panel
-# label the reading with its age instead of implying it is live.
+# "claude" probes the API live. "codex" asks its local app-server for the
+# account's live rate limits, falling back to its session logs. "grok" and
+# "agy" have no queryable usage endpoint, so they read the numbers their own
+# CLI already wrote to disk: that costs nothing and needs no credentials, but
+# the value only advances when you actually run that CLI — hence `local:
+# True`, which makes the panel label the reading with its age instead of
+# implying it is live. `watch` names the file that CLI rewrites; the tray
+# re-reads as soon as it changes rather than waiting out `interval`.
 PROVIDERS = {
     "claude": {
         "label": "Claude Code",
@@ -68,6 +73,7 @@ PROVIDERS = {
         "interval": 60,
         "local": True,
         "hint": "No usage recorded yet - run `grok` once.",
+        "watch": GROK_LOG_FILE,
     },
     "agy": {
         "label": "Antigravity",
@@ -75,6 +81,7 @@ PROVIDERS = {
         "local": True,
         "hint": "No usage recorded yet - run `agy` once (needs the "
                 "hud/agy-hud.py statusLine).",
+        "watch": AGY_STATUS_FILE,
     },
 }
 DEFAULT_PROVIDER = "claude"
@@ -347,10 +354,13 @@ def parse_unified_limits(headers: dict) -> dict:
 
 # ── Local providers (Codex / Grok / agy) ─────────────────────────
 #
-# None of these CLIs offers a headless "show my usage" command, but both already
+# Grok and agy offer no headless "show my usage" command, but both already
 # write the figure their own UI displays into a file under $HOME. We read
 # that file. No network, no credentials, no quota spent — at the cost of the
-# reading being only as fresh as the last time you ran that CLI.
+# reading being only as fresh as the last time you ran that CLI. Codex's
+# session logs have the same limit, so they are only its fallback: usage
+# from anywhere but this machine's CLI (web, IDE, another host) never
+# reaches them.
 
 def _derived_status(pct: float) -> str:
     """Local sources carry no server status field, so derive one from usage."""
@@ -375,7 +385,128 @@ def _tail_lines(path: Path, max_bytes: int = 512 * 1024) -> list[str]:
     return blob.decode("utf-8", errors="replace").splitlines()
 
 
+CODEX_LIVE_TIMEOUT = 15   # seconds for the whole app-server exchange
+CODEX_LIVE_MAX_BYTES = 1 << 20   # a reply this size is not a rate-limit read
+
+
+def _codex_binary() -> str | None:
+    """The codex CLI: on PATH, else the newest nvm install (autostart PATHs
+    don't always include nvm's bin dir)."""
+    found = shutil.which("codex")
+    if found:
+        return found
+    candidates = []
+    for path in Path.home().glob(".nvm/versions/node/*/bin/codex"):
+        try:
+            candidates.append((path.stat().st_mtime, path))
+        except OSError:
+            continue   # dangling symlink, or removed mid-scan
+    return str(max(candidates)[1]) if candidates else None
+
+
 def fetch_codex_usage() -> dict:
+    """Codex's live rate limits, else the last ones its session logs hold."""
+    data = _fetch_codex_live()
+    if data is not None:
+        return data
+    return _fetch_codex_logged()
+
+
+def _fetch_codex_live() -> dict | None:
+    """Ask `codex app-server` for the account's current rate limits.
+
+    `account/rateLimits/read` is a read: it reports usage without spending
+    any. Any failure (no CLI, not logged in, protocol change, timeout)
+    returns None so the caller falls back to the session logs.
+    """
+    binary = _codex_binary()
+    if binary is None:
+        return None
+    env = dict(os.environ)
+    # codex is a node script; let `#!/usr/bin/env node` find the node that
+    # sits next to it even when that bin dir is not on our PATH.
+    env["PATH"] = os.path.dirname(binary) + os.pathsep + env.get("PATH", "")
+    try:
+        proc = subprocess.Popen(
+            [binary, "app-server"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    except OSError:
+        return None
+    deadline = time.monotonic() + CODEX_LIVE_TIMEOUT
+    reader = _JsonRpcReader(proc)
+
+    def send(*msgs):
+        proc.stdin.write(b"".join(json.dumps(m).encode() + b"\n"
+                                  for m in msgs))
+        proc.stdin.flush()
+
+    try:
+        # The protocol wants the initialize reply before anything else.
+        send({"id": 1, "method": "initialize",
+              "params": {"clientInfo": {"name": APP_NAME, "version": "1"}}})
+        result = None
+        if reader.result(1, deadline) is not None:
+            send({"method": "initialized"},
+                 {"id": 2, "method": "account/rateLimits/read"})
+            result = reader.result(2, deadline)
+    except (OSError, ValueError):
+        result = None
+    finally:
+        proc.kill()
+        proc.wait()
+    if not isinstance(result, dict):
+        return None
+    limits = result.get("rateLimits")
+    if not isinstance(limits, dict):
+        return None
+    data = _parse_codex_limits(
+        limits, used_key="usedPercent", minutes_key="windowDurationMins",
+        resets_key="resetsAt", plan_key="planType",
+        fetched_at=datetime.now(timezone.utc).isoformat())
+    return None if "error" in data else data
+
+
+class _JsonRpcReader:
+    """Newline-delimited JSON-RPC replies from a child's stdout.
+
+    Notifications arrive interleaved with responses, so skip until the id
+    matches. A selector bounds every wait and the buffer is capped: a wedged
+    or runaway server must never hang or bloat the tray's refresh thread.
+    """
+
+    def __init__(self, proc: subprocess.Popen):
+        self._fd = proc.stdout.fileno()
+        self._buf = bytearray()
+        self._read = 0
+
+    def result(self, want_id: int, deadline: float):
+        """The `result` of response `want_id`, or None (error reply,
+        timeout, server exit or oversized output)."""
+        with selectors.DefaultSelector() as sel:
+            sel.register(self._fd, selectors.EVENT_READ)
+            while True:
+                while (nl := self._buf.find(b"\n")) >= 0:
+                    line = bytes(self._buf[:nl])
+                    del self._buf[:nl + 1]
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(msg, dict) and msg.get("id") == want_id:
+                        return msg.get("result")
+                left = deadline - time.monotonic()
+                if left <= 0 or not sel.select(left):
+                    return None
+                chunk = os.read(self._fd, 65536)
+                if not chunk:
+                    return None   # server exited
+                self._read += len(chunk)
+                if self._read > CODEX_LIVE_MAX_BYTES:
+                    return None
+                self._buf += chunk
+
+
+def _fetch_codex_logged() -> dict:
     """Latest rate limits Codex recorded in its session rollout logs.
 
     Codex appends a `token_count` event carrying `rate_limits` after each
@@ -409,11 +540,22 @@ def fetch_codex_usage() -> dict:
 
 
 def _parse_codex_record(record: dict) -> dict:
-    limits = record["payload"]["rate_limits"]
+    return _parse_codex_limits(
+        record["payload"]["rate_limits"], used_key="used_percent",
+        minutes_key="window_minutes", resets_key="resets_at",
+        plan_key="plan_type",
+        fetched_at=_iso_or_now(record.get("timestamp")))
+
+
+def _parse_codex_limits(limits: dict, *, used_key: str, minutes_key: str,
+                        resets_key: str, plan_key: str,
+                        fetched_at: str) -> dict:
+    """Codex rate limits -> our data shape. The session logs spell the keys
+    in snake_case and the app-server in camelCase; the shape is the same."""
     data = {
-        "fetched_at": _iso_or_now(record.get("timestamp")),
+        "fetched_at": fetched_at,
         "representative_claim": "",
-        "plan": limits.get("plan_type") or "",
+        "plan": limits.get(plan_key) or "",
         "windows": {},
     }
 
@@ -422,19 +564,21 @@ def _parse_codex_record(record: dict) -> dict:
     # each holds varies by plan, so key them by their own window_minutes.
     for slot in ("primary", "secondary"):
         window = limits.get(slot)
-        if not window:
+        if not isinstance(window, dict):
             continue
         try:
-            pct = float(window["used_percent"])
+            pct = float(window[used_key])
         except (KeyError, TypeError, ValueError):
             continue
-        minutes = window.get("window_minutes")
+        if not math.isfinite(pct):
+            continue
+        minutes = window.get(minutes_key)
         wid = _MINUTES_TO_WINDOW.get(minutes)
         if wid is None:
             continue   # an unmapped window has no label or ordering slot
         data["windows"][wid] = {
             "utilization": str(pct / 100.0),
-            "reset": str(window.get("resets_at", "")),
+            "reset": str(window.get(resets_key, "")),
             "status": _derived_status(pct),
         }
         worst = max(worst, pct)
@@ -1415,12 +1559,14 @@ class UsageMonitor:
         self._running = True
         self._panel_proc: subprocess.Popen | None = None
         self._last_click: float = 0.0
+        self._watch_mtime: float | None = self._watched_mtime()
 
-    def refresh(self):
+    def refresh(self) -> bool:
+        """Fetch and apply. False if another refresh was already running."""
         # Single-flight: collapse overlapping refreshes (auto timer, menu,
         # startup) so we never fire concurrent API probes.
         if not self._refresh_inflight.acquire(blocking=False):
-            return
+            return False
         try:
             data = fetch_for_provider(PROVIDER)
             if data is None:
@@ -1435,6 +1581,7 @@ class UsageMonitor:
             self._update_icon()
         finally:
             self._refresh_inflight.release()
+        return True
 
     def _update_icon(self):
         if not self.icon:
@@ -1460,8 +1607,23 @@ class UsageMonitor:
         else:
             self.icon.title = f"{spec['label']} Usage Monitor"
 
+    def _watched_mtime(self) -> float | None:
+        watch = PROVIDERS[PROVIDER].get("watch")
+        try:
+            return watch.stat().st_mtime if watch else None
+        except OSError:
+            return None
+
+    def _refresh_for_watch(self, mtime: float):
+        # Only mark this change seen once a refresh actually read it. If one
+        # was already in flight (it may have read the file just before the
+        # change), the next 2s poll sees the same mtime and tries again.
+        if self.refresh():
+            self._watch_mtime = mtime
+
     def _poll_trigger(self):
-        """Every 2s, reload the cache if the panel signalled a refresh.
+        """Every 2s, reload the cache if the panel signalled a refresh, and
+        re-read a local provider whose CLI just rewrote its usage file.
 
         The panel subprocess already performed the network probe and wrote the
         cache, so we only reload it here — no redundant second API call.
@@ -1483,6 +1645,12 @@ class UsageMonitor:
                     self.usage_data = data
             if data is not None:
                 self._update_icon()
+        # A stat every 2s is cheap; the read itself runs on its own thread
+        # so a slow parse never delays this timer chain.
+        mtime = self._watched_mtime()
+        if mtime is not None and mtime != self._watch_mtime:
+            threading.Thread(target=self._refresh_for_watch, args=(mtime,),
+                             daemon=True).start()
         self._poll_timer = threading.Timer(2.0, self._poll_trigger)
         self._poll_timer.daemon = True
         self._poll_timer.start()
