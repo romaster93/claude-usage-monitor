@@ -616,9 +616,13 @@ def fetch_grok_usage() -> dict:
 
     ctx = record["ctx"]
     config = ctx["config"]
+    # Grok >= 1.0 serializes this record protojson-style: plain scalar fields
+    # are omitted when zero, while wrapper-typed ones (onDemandCap etc.) keep
+    # their {"val": 0}. A config record without creditUsagePercent therefore
+    # means 0% used, not "no data".
     try:
-        pct = float(config["creditUsagePercent"])
-    except (KeyError, TypeError, ValueError):
+        pct = float(config.get("creditUsagePercent", 0.0))
+    except (TypeError, ValueError):
         return {"error": "Grok reported no usage percentage"}
 
     period = config.get("currentPeriod") or {}
@@ -741,9 +745,10 @@ def fetch_for_provider(provider: str) -> dict | None:
 # mark, followed by the usage number in a 5x9 pixel font. Everything is drawn
 # 1:1 with no antialiasing and no scaling.
 #
-# The canvas is deliberately non-square: GNOME's appindicator extension
-# rescales square icons to 16x16 (blurring them) but shows wide ones at their
-# native size, so a 36x16 image lands on the top bar pixel-exact.
+# On the AppIndicator backend only the 16x16 tile is used and the number
+# goes in the indicator label instead: GNOME's appindicator extension forces
+# every icon into a square icon-size box, so a wide 36x16 image gets squashed
+# horizontally. Other backends keep the combined tile + number image.
 #
 # Sprite data is plain string grids: '.' transparent, '#' glyph ink.
 
@@ -958,18 +963,22 @@ def _draw_pixel_text(img: Image.Image, text: str, color: tuple,
         px[ix, iy] = (*color, 255)
 
 
+def icon_text(percent: int | None, error: bool = False) -> tuple[str, tuple]:
+    """The usage number shown next to the tile, and its colour."""
+    if error:
+        return "!", ICON_ERROR_COLOR
+    if percent is None:
+        return "--", ICON_NODATA_COLOR
+    pct = max(0, min(100, int(percent)))
+    return str(pct), ICON_COLORS[usage_level(pct)]
+
+
 def make_icon(provider: str, percent: int | None,
               error: bool = False) -> Image.Image:
     """36x16 tray image: brand tile + usage number. Hand to pystray unscaled."""
     img = Image.new("RGBA", (ICON_W, ICON_H), (0, 0, 0, 0))
     img.paste(brand_tile(provider), (0, 0))
-    if error:
-        text, color = "!", ICON_ERROR_COLOR
-    elif percent is None:
-        text, color = "--", ICON_NODATA_COLOR
-    else:
-        pct = max(0, min(100, int(percent)))
-        text, color = str(pct), ICON_COLORS[usage_level(pct)]
+    text, color = icon_text(percent, error)
     # Left-aligned against the tile so each tile + number reads as one unit.
     _draw_pixel_text(img, text, color, TILE + TILE_GAP + 1,
                      (ICON_H - PIXEL_FONT_H) // 2)
@@ -1590,7 +1599,7 @@ class UsageMonitor:
         has_error = bool(data and "error" in data)
         pct = get_primary_percent(data)
         spec = PROVIDERS[PROVIDER]
-        self.icon.icon = make_icon(PROVIDER, pct, error=has_error)
+        self._set_tray_image(pct, has_error)
         if has_error:
             self.icon.title = f"{spec['label']}: {data['error']}"
         elif pct is not None:
@@ -1606,6 +1615,18 @@ class UsageMonitor:
             self.icon.title = title
         else:
             self.icon.title = f"{spec['label']} Usage Monitor"
+
+    def _set_tray_image(self, pct: int | None, error: bool):
+        indicator = getattr(self.icon, "_appindicator", None)
+        if indicator is None:
+            self.icon.icon = make_icon(PROVIDER, pct, error=error)
+            return
+        text, _ = icon_text(pct, error)
+        label = text if error or pct is None else f"{text}%"
+        self.icon.icon = brand_tile(PROVIDER)
+        # AppIndicator calls must run on the GTK main loop thread.
+        from gi.repository import GLib
+        GLib.idle_add(lambda: indicator.set_label(label, "100%") and False)
 
     def _watched_mtime(self) -> float | None:
         watch = PROVIDERS[PROVIDER].get("watch")
