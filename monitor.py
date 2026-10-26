@@ -27,6 +27,10 @@ CONFIG_DIR = Path.home() / ".config" / APP_NAME
 CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 GROK_LOG_FILE = Path.home() / ".grok" / "logs" / "unified.jsonl"
+AGY_DIR = Path.home() / ".gemini" / "antigravity-cli"
+# Written by the agy statusLine command (hud/agy-hud.py): a verbatim copy of
+# the JSON agy pipes to it, which includes the account's quota buckets.
+AGY_STATUS_FILE = AGY_DIR / "hud" / "cache" / "last_stdin.json"
 
 PROBE_MODEL = "claude-haiku-4-5-20251001"
 
@@ -35,7 +39,7 @@ PROBE_MODEL = "claude-haiku-4-5-20251001"
 # Each provider runs as its own process with its own tray icon, cache, lock
 # and refresh trigger, so one provider failing can never take down another.
 #
-# "claude" probes the API live. "codex" and "grok" have no queryable usage
+# "claude" probes the API live. "codex", "grok" and "agy" have no queryable usage
 # endpoint, so they read the numbers their own CLI already wrote to disk:
 # that costs nothing and needs no credentials, but the value only advances
 # when you actually run that CLI — hence `local: True`, which makes the panel
@@ -60,6 +64,14 @@ PROVIDERS = {
         "interval": 60,
         "local": True,
         "hint": "No usage recorded yet - run `grok` once.",
+    },
+    "agy": {
+        "label": "Antigravity",
+        "accent": (200, 140, 255),
+        "interval": 60,
+        "local": True,
+        "hint": "No usage recorded yet - run `agy` once (needs the "
+                "hud/agy-hud.py statusLine).",
     },
 }
 DEFAULT_PROVIDER = "claude"
@@ -108,16 +120,26 @@ THEME = {
 # ── Usage windows ────────────────────────────────────────────────
 
 WINDOW_LABELS = {"5h": "5 Hours", "7d": "7 Days", "24h": "24 Hours",
-                 "1h": "1 Hour", "30d": "30 Days"}
-WINDOW_ORDER = tuple(WINDOW_LABELS)  # ("5h", "7d", "24h", "1h", "30d")
+                 "1h": "1 Hour", "30d": "30 Days",
+                 # agy meters third-party (non-Gemini) models separately
+                 "3p-5h": "5 Hours (3P)", "3p-7d": "7 Days (3P)"}
+WINDOW_ORDER = tuple(WINDOW_LABELS)  # ("5h", "7d", ..., "3p-5h", "3p-7d")
 
 # Codex reports its window as a raw minute count; Grok as a period enum.
-# Both map onto the same window ids the Claude headers use.
+# Both map onto the same window ids the Claude headers use, as do agy's
+# named quota buckets.
 _MINUTES_TO_WINDOW = {60: "1h", 300: "5h", 1440: "24h", 10080: "7d", 43200: "30d"}
 _GROK_PERIOD_TO_WINDOW = {
     "USAGE_PERIOD_TYPE_WEEKLY": "7d",
     "USAGE_PERIOD_TYPE_MONTHLY": "30d",
     "USAGE_PERIOD_TYPE_DAILY": "24h",
+}
+
+_AGY_BUCKET_TO_WINDOW = {
+    "gemini-5h": "5h",
+    "gemini-weekly": "7d",
+    "3p-5h": "3p-5h",
+    "3p-weekly": "3p-7d",
 }
 
 _REP_ALIASES = {"five_hour": "5h", "seven_day": "7d"}
@@ -253,9 +275,9 @@ def parse_unified_limits(headers: dict) -> dict:
     return data
 
 
-# ── Local providers (Codex / Grok) ───────────────────────────────
+# ── Local providers (Codex / Grok / agy) ─────────────────────────
 #
-# Neither CLI offers a headless "show my usage" command, but both already
+# None of these CLIs offers a headless "show my usage" command, but both already
 # write the figure their own UI displays into a file under $HOME. We read
 # that file. No network, no credentials, no quota spent — at the cost of the
 # reading being only as fresh as the last time you ran that CLI.
@@ -420,6 +442,60 @@ def _grok_val(config: dict, key: str) -> float:
         return 0.0
 
 
+def fetch_agy_usage() -> dict:
+    """Latest quota agy handed to its statusLine command.
+
+    agy pipes a JSON status blob to the statusLine command on every render;
+    hud/agy-hud.py saves it verbatim. Its `quota` object holds one bucket per
+    meter (Gemini vs third-party models, 5h vs weekly) as `remaining_fraction`.
+    The file has no timestamp of its own, so its mtime is the reading's age.
+    """
+    try:
+        mtime = AGY_STATUS_FILE.stat().st_mtime
+        with open(AGY_STATUS_FILE) as f:
+            status = json.load(f)
+    except FileNotFoundError:
+        return {"error": PROVIDERS["agy"]["hint"]}
+    except (OSError, json.JSONDecodeError):
+        return {"error": f"Cannot read {AGY_STATUS_FILE}"}
+
+    quota = status.get("quota") if isinstance(status, dict) else None
+    if not isinstance(quota, dict) or not quota:
+        return {"error": "agy reported no quota"}
+
+    data = {
+        "fetched_at": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+        "representative_claim": "",
+        "plan": "",
+        "windows": {},
+    }
+
+    worst = -1.0
+    for bucket, wid in _AGY_BUCKET_TO_WINDOW.items():
+        b = quota.get(bucket)
+        if not isinstance(b, dict):
+            continue
+        try:
+            pct = (1.0 - float(b["remaining_fraction"])) * 100
+        except (KeyError, TypeError, ValueError):
+            continue
+        data["windows"][wid] = {
+            "utilization": str(pct / 100.0),
+            "reset": b.get("reset_time", ""),
+            "status": _derived_status(pct),
+        }
+        # Four meters but one tray number: show whichever is closest to
+        # running out, since that is the one that will stop you first.
+        if pct > worst:
+            worst = pct
+            data["representative_claim"] = wid
+
+    if not data["windows"]:
+        return {"error": "agy reported no usable quota bucket"}
+    data["status"] = _derived_status(worst)
+    return data
+
+
 def _iso_or_now(value) -> str:
     """Normalize a logged timestamp to ISO-8601, falling back to now."""
     if isinstance(value, str) and value:
@@ -437,6 +513,8 @@ def fetch_for_provider(provider: str) -> dict | None:
         return fetch_codex_usage()
     if provider == "grok":
         return fetch_grok_usage()
+    if provider == "agy":
+        return fetch_agy_usage()
     token = get_token()
     if not token:
         return None
@@ -1136,7 +1214,7 @@ class UsageMonitor:
     def run(self):
         spec = PROVIDERS[PROVIDER]
         # Only the Claude provider needs credentials, and only it can be so
-        # broken at startup that there is nothing to show. Codex and Grok read
+        # broken at startup that there is nothing to show. Codex, Grok and agy read
         # files that simply may not exist yet, which the panel reports as a
         # hint rather than a fatal error — their tray icon still comes up.
         if not spec["local"] and not get_token():

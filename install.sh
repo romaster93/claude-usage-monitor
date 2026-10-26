@@ -66,9 +66,9 @@ fi
 
 # Desktop entries: one tray icon per provider, each its own process.
 #
-# Claude always gets entries. Codex and Grok read usage out of their own CLI's
-# files, so an entry for a CLI that isn't installed would only ever show an
-# error — install those two only when their config directory exists.
+# Claude always gets entries. Codex, Grok and agy read usage out of their own
+# CLI's files, so an entry for a CLI that isn't installed would only ever show
+# an error — install those only when their config directory exists.
 AUTOSTART_DIR="$HOME/.config/autostart"
 LAUNCHER_DIR="$HOME/.local/share/applications"
 mkdir -p "$AUTOSTART_DIR" "$LAUNCHER_DIR"
@@ -116,6 +116,14 @@ else
     echo "[--] Grok not detected (~/.grok missing) - skipped"
 fi
 
+if [ -d "$HOME/.gemini/antigravity-cli" ]; then
+    write_entries agy "Antigravity"
+else
+    rm -f "$AUTOSTART_DIR/$APP_NAME-agy.desktop" \
+          "$LAUNCHER_DIR/$APP_NAME-agy.desktop"
+    echo "[--] Antigravity not detected (~/.gemini/antigravity-cli missing) - skipped"
+fi
+
 # Refresh the application database so the launcher shows up immediately
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$LAUNCHER_DIR" 2>/dev/null || true
@@ -140,9 +148,10 @@ echo "Usage:"
 echo "  Start now:    python3 $MONITOR_PY --provider claude"
 echo "                python3 $MONITOR_PY --provider codex"
 echo "                python3 $MONITOR_PY --provider grok"
+echo "                python3 $MONITOR_PY --provider agy"
 echo "  Auto-starts on login (one tray icon per installed provider)"
 echo ""
-echo "Codex and Grok usage is read from the files those CLIs write, so their"
+echo "Codex, Grok and agy usage is read from the files those CLIs write, so their"
 echo "numbers only advance when you actually run them; the panel states the"
 echo "age of each reading."
 echo ""
