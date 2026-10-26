@@ -3,9 +3,15 @@
 
 Reads the OAuth token from Claude Code's credentials file and displays
 real-time usage (5h / 7d windows) in the system tray with a dropdown panel.
+Codex, Grok and Antigravity usage are read from the files their CLIs write.
+Each provider gets its own pixel-art tray icon; clicking any of them opens one
+panel that bundles every provider.
 """
 
+import base64
+import io
 import json
+import math
 import os
 import queue
 import signal
@@ -20,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pystray
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 APP_NAME = "claude-usage-monitor"
 CONFIG_DIR = Path.home() / ".config" / APP_NAME
@@ -38,6 +44,7 @@ PROBE_MODEL = "claude-haiku-4-5-20251001"
 #
 # Each provider runs as its own process with its own tray icon, cache, lock
 # and refresh trigger, so one provider failing can never take down another.
+# Only the panel is shared: it reads every provider's cache itself.
 #
 # "claude" probes the API live. "codex", "grok" and "agy" have no queryable usage
 # endpoint, so they read the numbers their own CLI already wrote to disk:
@@ -47,27 +54,23 @@ PROBE_MODEL = "claude-haiku-4-5-20251001"
 PROVIDERS = {
     "claude": {
         "label": "Claude Code",
-        "accent": (255, 150, 60),
         "interval": 300,
         "local": False,
     },
     "codex": {
         "label": "Codex",
-        "accent": (120, 220, 160),
         "interval": 60,
         "local": True,
         "hint": "No usage recorded yet - run `codex` once.",
     },
     "grok": {
         "label": "Grok",
-        "accent": (110, 170, 255),
         "interval": 60,
         "local": True,
         "hint": "No usage recorded yet - run `grok` once.",
     },
     "agy": {
         "label": "Antigravity",
-        "accent": (200, 140, 255),
         "interval": 60,
         "local": True,
         "hint": "No usage recorded yet - run `agy` once (needs the "
@@ -76,16 +79,41 @@ PROVIDERS = {
 }
 DEFAULT_PROVIDER = "claude"
 
-# Set by select_provider() before anything touches the paths below. Each
-# provider gets distinct files so three concurrent processes never collide.
+
+
+# Each provider gets distinct files so concurrent processes never collide.
+def cache_path(provider: str) -> Path:
+    return CONFIG_DIR / f"usage_cache_{provider}.json"
+
+
+def status_path(provider: str) -> Path:
+    """The tray's latest refresh outcome. The cache keeps only the last good
+    reading; this file says whether the newest attempt failed, so the shared
+    panel can show the same error the tray icon shows."""
+    return CONFIG_DIR / f"status_{provider}.json"
+
+
+def trigger_path(provider: str) -> Path:
+    """Per-user IPC trigger: the panel subprocess touches this to ask that
+    provider's tray process to reload its cache. Kept under CONFIG_DIR (not
+    world-writable /tmp)."""
+    return CONFIG_DIR / f"refresh_{provider}.trigger"
+
+
+def lock_path(provider: str) -> Path:
+    """Single-instance lock: holds the PID of the running tray monitor so that
+    autostart + a manual launcher click don't create duplicate tray icons."""
+    return CONFIG_DIR / f"monitor_{provider}.pid"
+
+
+# Holds the PID of the open combined panel, whichever tray icon opened it.
+PANEL_LOCK = CONFIG_DIR / "panel.pid"
+
+# Set by select_provider() before anything touches the paths below.
 PROVIDER = DEFAULT_PROVIDER
-CACHE_FILE = CONFIG_DIR / f"usage_cache_{PROVIDER}.json"
-# Per-user IPC trigger: the panel subprocess touches this to ask the main
-# process to reload the cache. Kept under CONFIG_DIR (not world-writable /tmp).
-REFRESH_TRIGGER = CONFIG_DIR / f"refresh_{PROVIDER}.trigger"
-# Single-instance lock: holds the PID of the running tray monitor so that
-# autostart + a manual launcher click don't create duplicate tray icons.
-LOCK_FILE = CONFIG_DIR / f"monitor_{PROVIDER}.pid"
+CACHE_FILE = cache_path(PROVIDER)
+REFRESH_TRIGGER = trigger_path(PROVIDER)
+LOCK_FILE = lock_path(PROVIDER)
 REFRESH_INTERVAL = PROVIDERS[PROVIDER]["interval"]
 
 
@@ -93,9 +121,9 @@ def select_provider(provider: str):
     """Point every per-provider path at `provider`. Call once, at startup."""
     global PROVIDER, CACHE_FILE, REFRESH_TRIGGER, LOCK_FILE, REFRESH_INTERVAL
     PROVIDER = provider
-    CACHE_FILE = CONFIG_DIR / f"usage_cache_{provider}.json"
-    REFRESH_TRIGGER = CONFIG_DIR / f"refresh_{provider}.trigger"
-    LOCK_FILE = CONFIG_DIR / f"monitor_{provider}.pid"
+    CACHE_FILE = cache_path(provider)
+    REFRESH_TRIGGER = trigger_path(provider)
+    LOCK_FILE = lock_path(provider)
     REFRESH_INTERVAL = PROVIDERS[provider]["interval"]
 
 # ── Theme ────────────────────────────────────────────────────────
@@ -180,33 +208,75 @@ def get_token() -> str | None:
 
 # ── Cache ────────────────────────────────────────────────────────
 
-def load_cache() -> dict | None:
-    if CACHE_FILE.exists():
+def load_cache(provider: str | None = None) -> dict | None:
+    """Read a provider's cache (default: this process's provider)."""
+    path = cache_path(provider) if provider else CACHE_FILE
+    if path.exists():
         try:
-            with open(CACHE_FILE) as f:
+            with open(path) as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             return None
     return None
 
 
-def save_cache(data: dict):
+def save_cache(data: dict, provider: str | None = None):
     """Atomically persist the cache.
 
     Writes to a per-process temp file then os.replace()s it into place, so a
     crash mid-write or a concurrent writer (main process vs --panel
     subprocess) can never leave a truncated/corrupt cache. Errors are
     swallowed: a failed cache write must not propagate and kill the refresh
-    timer chain.
+    timer chain. `provider` defaults to this process's provider; the panel
+    passes it explicitly because it refreshes every provider.
     """
+    path = cache_path(provider) if provider else CACHE_FILE
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = CACHE_FILE.with_suffix(f".tmp.{os.getpid()}")
+        tmp = path.with_suffix(f".tmp.{os.getpid()}")
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
-        os.replace(tmp, CACHE_FILE)  # atomic on the same filesystem
+        os.replace(tmp, path)  # atomic on the same filesystem
     except OSError:
         pass
+
+
+def save_status(provider: str, error: str | None):
+    """Record the outcome of the newest refresh: an error message, or None
+    once a refresh succeeded. Same atomic write as save_cache()."""
+    path = status_path(provider)
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".tmp.{os.getpid()}")
+        with open(tmp, "w") as f:
+            json.dump({"error": error,
+                       "at": datetime.now(timezone.utc).isoformat()}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def load_status_error(provider: str) -> str | None:
+    """The error from the provider's newest refresh, or None if it succeeded
+    (or no status was ever written)."""
+    try:
+        with open(status_path(provider)) as f:
+            err = json.load(f).get("error")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    return err if isinstance(err, str) and err else None
+
+
+def load_panel_data(provider: str) -> dict | None:
+    """What the panel shows for a provider: the last good cache, with the
+    newest refresh error (if any) laid over it under "error"."""
+    data = load_cache(provider)
+    err = load_status_error(provider)
+    if err is None:
+        return data
+    merged = dict(data or {})
+    merged["error"] = err
+    return merged
 
 
 # ── API ──────────────────────────────────────────────────────────
@@ -522,6 +592,156 @@ def fetch_for_provider(provider: str) -> dict | None:
 
 
 # ── Icon ─────────────────────────────────────────────────────────
+#
+# Each tray image is a 16x16 brand-coloured pixel tile holding the provider's
+# mark, followed by the usage number in a 5x9 pixel font. Everything is drawn
+# 1:1 with no antialiasing and no scaling.
+#
+# The canvas is deliberately non-square: GNOME's appindicator extension
+# rescales square icons to 16x16 (blurring them) but shows wide ones at their
+# native size, so a 36x16 image lands on the top bar pixel-exact.
+#
+# Sprite data is plain string grids: '.' transparent, '#' glyph ink.
+
+TILE = 16
+TILE_GAP = 1          # transparent column between the tile and the number
+NUMBER_W = 19         # 3 digits (5) + 2 gaps (1) + 1 px outline each side
+ICON_W = TILE + TILE_GAP + NUMBER_W   # 36
+ICON_H = 16
+
+ICON_ERROR_COLOR = (255, 40, 40)
+ICON_NODATA_COLOR = (0, 200, 255)
+ICON_OUTLINE = (0, 0, 0)
+
+# Rounded tile: 'x' = tile, '.' = transparent corner.
+TILE_MASK = [
+    "..xxxxxxxxxxxx..",
+    ".xxxxxxxxxxxxxx.",
+] + ["xxxxxxxxxxxxxxxx"] * 12 + [
+    ".xxxxxxxxxxxxxx.",
+    "..xxxxxxxxxxxx..",
+]
+
+# Tile fill (top, bottom: a vertical gradient), 1 px rim, glyph ink. The rim
+# keeps the white and the black tile visible on a bar of the same colour.
+BRANDS = {
+    "claude": {"top": (217, 119, 87), "bot": (217, 119, 87),
+               "rim": None, "ink": (250, 240, 230)},
+    "codex": {"top": (245, 245, 245), "bot": (245, 245, 245),
+              "rim": (150, 150, 150), "ink": (10, 10, 10)},
+    "grok": {"top": (0, 0, 0), "bot": (0, 0, 0),
+             "rim": (120, 120, 120), "ink": (255, 255, 255)},
+    "agy": {"top": (66, 133, 244), "bot": (155, 114, 203),
+            "rim": None, "ink": (255, 255, 255)},
+}
+
+GLYPHS = {
+    # Claude: cream starburst with uneven rays, like the real mark.
+    "claude": [
+        ".....#......",
+        "..#..#...#..",
+        "...#.#..#...",
+        "....###.#...",
+        ".##.####..##",
+        "...######...",
+        "#########...",
+        "...######.##",
+        ".##.####....",
+        "...#.##.#...",
+        "..#..#...#..",
+        "......#.....",
+    ],
+    # OpenAI / Codex: 6-blade aperture around a hexagonal hole. 13x13 so the
+    # whole grid fits inside the rim; cropped to 12x12 it came out lopsided.
+    "codex": [
+        ".....####....",
+        "..##.#####...",
+        ".###.###..##.",
+        ".###.##..###.",
+        "####....#####",
+        "..##......###",
+        "#...........#",
+        "###......##..",
+        "#####....####",
+        ".###..##.###.",
+        ".##..###.###.",
+        "...#####.##..",
+        "....####.....",
+    ],
+    # Grok / xAI: slashed X - a heavy '\' plus a '/' broken at the centre.
+    "grok": [
+        "##.........#",
+        "###.......#.",
+        ".###.....#..",
+        "..###...#...",
+        "...###......",
+        "....###.....",
+        ".....###....",
+        "..##..###...",
+        ".##....###..",
+        "##......###.",
+        "#........###",
+        "..........##",
+    ],
+    # Gemini / Antigravity: four-point star.
+    "agy": [
+        ".....##.....",
+        ".....##.....",
+        "....####....",
+        "....####....",
+        "...######...",
+        "############",
+        "############",
+        "...######...",
+        "....####....",
+        "....####....",
+        ".....##.....",
+        ".....##.....",
+    ],
+}
+
+# Bold 5x9 digits ("!" and "-" are narrower) for the usage number.
+PIXEL_FONT = {
+    "0": [".###.", "##.##", "##.##", "##.##", "##.##",
+          "##.##", "##.##", "##.##", ".###."],
+    "1": ["..##.", ".###.", "####.", "..##.", "..##.",
+          "..##.", "..##.", "..##.", "#####"],
+    "2": [".###.", "##.##", "...##", "...##", "..##.",
+          ".##..", "##...", "##...", "#####"],
+    "3": ["####.", "...##", "...##", "...##", ".###.",
+          "...##", "...##", "...##", "####."],
+    "4": ["...##", "..###", ".####", "##.##", "##.##",
+          "#####", "...##", "...##", "...##"],
+    "5": ["#####", "##...", "##...", "####.", "...##",
+          "...##", "...##", "##.##", ".###."],
+    "6": [".###.", "##...", "##...", "####.", "##.##",
+          "##.##", "##.##", "##.##", ".###."],
+    "7": ["#####", "...##", "...##", "..##.", "..##.",
+          ".##..", ".##..", ".##..", ".##.."],
+    "8": [".###.", "##.##", "##.##", "##.##", ".###.",
+          "##.##", "##.##", "##.##", ".###."],
+    "9": [".###.", "##.##", "##.##", "##.##", ".####",
+          "...##", "...##", "...##", ".###."],
+    "!": ["##", "##", "##", "##", "##", "##", "..", "##", "##"],
+    "-": ["....", "....", "....", "....", "####",
+          "####", "....", "....", "...."],
+}
+PIXEL_FONT_H = 9
+PIXEL_CHAR_GAP = 1
+
+
+def parse_utilization(raw) -> float | None:
+    """A window's utilization (0..1) as a finite float, else None.
+
+    float() happily accepts "nan" and "inf", and int(inf) raises
+    OverflowError — which, on a timer thread, would end that timer's chain.
+    """
+    try:
+        util = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return util if math.isfinite(util) else None
+
 
 def get_primary_percent(data: dict | None) -> int | None:
     if not data or "error" in data:
@@ -530,79 +750,162 @@ def get_primary_percent(data: dict | None) -> int | None:
     rep = normalize_rep(data.get("representative_claim", ""))
     for key in [rep, *WINDOW_ORDER]:
         if key in windows and "utilization" in windows[key]:
-            try:
-                return int(float(windows[key]["utilization"]) * 100)
-            except (TypeError, ValueError):
-                continue  # malformed header value — try the next window
+            util = parse_utilization(windows[key]["utilization"])
+            if util is not None:
+                return int(util * 100)
+            # malformed header value — try the next window
     return None
 
 
-def _color_for_pct(pct: int) -> tuple:
-    return ICON_COLORS[usage_level(pct)]
+def brand_tile(provider: str) -> Image.Image:
+    """The provider's 16x16 brand tile (also reused, enlarged, by the panel)."""
+    b = BRANDS[provider]
+    img = Image.new("RGBA", (TILE, TILE), (0, 0, 0, 0))
+    px = img.load()
+    for y, row in enumerate(TILE_MASK):
+        t = y / (TILE - 1)
+        col = tuple(round(b["top"][i] + (b["bot"][i] - b["top"][i]) * t)
+                    for i in range(3))
+        for x, c in enumerate(row):
+            if c == "x":
+                px[x, y] = (*col, 255)
+    if b["rim"]:
+        # A tile pixel is rim if any 4-neighbour is off the tile.
+        for y, row in enumerate(TILE_MASK):
+            for x, c in enumerate(row):
+                if c != "x":
+                    continue
+                edge = any(
+                    not (0 <= x + dx < TILE and 0 <= y + dy < TILE)
+                    or TILE_MASK[y + dy][x + dx] != "x"
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+                if edge:
+                    px[x, y] = (*b["rim"], 255)
+    glyph = GLYPHS[provider]
+    off = (TILE - len(glyph)) // 2   # 12 -> 2, 13 -> 1 (still inside the rim)
+    for y, row in enumerate(glyph):
+        for x, c in enumerate(row):
+            if c == "#":
+                px[off + x, off + y] = (*b["ink"], 255)
+    return img
 
 
-def make_icon(percent: int | None, error: bool = False,
-              accent: tuple | None = None) -> Image.Image:
-    """Big bold number, rendered at 4x then downscaled for clean result.
+def _draw_pixel_text(img: Image.Image, text: str, color: tuple,
+                     x0: int, y0: int):
+    """Draw `text` with a 1 px black 8-neighbour outline, then the fill."""
+    px = img.load()
+    ink = []
+    x = x0
+    for ch in text:
+        glyph = PIXEL_FONT[ch]
+        for gy, row in enumerate(glyph):
+            for gx, c in enumerate(row):
+                if c == "#":
+                    ink.append((x + gx, y0 + gy))
+        x += len(glyph[0]) + PIXEL_CHAR_GAP
+    w, h = img.size
+    for ix, iy in ink:
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                ox, oy = ix + dx, iy + dy
+                if 0 <= ox < w and 0 <= oy < h:
+                    px[ox, oy] = (*ICON_OUTLINE, 255)
+    for ix, iy in ink:
+        px[ix, iy] = (*color, 255)
 
-    `accent` paints a thin bar along the bottom edge. With one tray icon per
-    provider the bare number is ambiguous, and the bar identifies the source
-    without stealing width from the digits.
-    """
-    OUT = 24
-    SCALE = 4
-    R = OUT * SCALE  # render size
-    BAR = 3 * SCALE
-    img = Image.new("RGBA", (R, R), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
 
+def make_icon(provider: str, percent: int | None,
+              error: bool = False) -> Image.Image:
+    """36x16 tray image: brand tile + usage number. Hand to pystray unscaled."""
+    img = Image.new("RGBA", (ICON_W, ICON_H), (0, 0, 0, 0))
+    img.paste(brand_tile(provider), (0, 0))
     if error:
-        text = "!"
-        color = (255, 40, 40)
+        text, color = "!", ICON_ERROR_COLOR
     elif percent is None:
-        text = "--"
-        color = (0, 200, 255)
+        text, color = "--", ICON_NODATA_COLOR
     else:
-        text = str(percent)
-        color = _color_for_pct(percent)
+        pct = max(0, min(100, int(percent)))
+        text, color = str(pct), ICON_COLORS[usage_level(pct)]
+    # Left-aligned against the tile so each tile + number reads as one unit.
+    _draw_pixel_text(img, text, color, TILE + TILE_GAP + 1,
+                     (ICON_H - PIXEL_FONT_H) // 2)
+    return img
 
+
+# ── Process discovery ────────────────────────────────────────────
+#
+# The combined panel acts on every provider's monitor (Quit stops them all),
+# so a PID read from a lock file is only trusted once /proc confirms it is
+# still *this* program in the expected role. PIDs get reused; a stale lock
+# must never make us signal an unrelated process.
+
+def _monitor_args(pid: int) -> list[str] | None:
+    """argv after `monitor.py` for a live monitor.py process, else None."""
     try:
-        if len(text) <= 1:
-            fs = 80
-        elif len(text) == 2:
-            fs = 64
-        else:
-            fs = 48
-        # Force the BASIC layout engine: pystray's native deps pull in a
-        # libraqm that conflicts with Pillow's default Raqm layout, making
-        # truetype rendering non-deterministic / blank (the tray icon would
-        # render empty). BASIC is deterministic and fine for single-line text.
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", fs,
-            layout_engine=ImageFont.Layout.BASIC)
-    except (IOError, OSError):
-        font = ImageFont.load_default()
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    args = raw.decode("utf-8", errors="replace").split("\0")
+    if args and args[-1] == "":
+        args.pop()   # cmdline is NUL-terminated
+    for i, arg in enumerate(args[:3]):   # [python, monitor.py, ...]
+        if os.path.basename(arg) != "monitor.py":
+            continue
+        # Same script, not merely some file called monitor.py: resolve a
+        # relative argv entry against that process's own cwd.
+        try:
+            if not os.path.isabs(arg):
+                arg = os.path.join(os.readlink(f"/proc/{pid}/cwd"), arg)
+        except OSError:
+            return None
+        if os.path.realpath(arg) != os.path.realpath(__file__):
+            return None
+        return args[i + 1:]
+    return None
 
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    # Centre the digits in the space above the accent bar, not the whole tile,
-    # so adding the bar doesn't push the number off-centre.
-    x = (R - tw) // 2
-    y = (R - BAR - th) // 2
 
-    # Clean black outline at 4x (becomes smooth after downscale)
-    for dx in range(-3, 4):
-        for dy in range(-3, 4):
-            if dx == 0 and dy == 0:
-                continue
-            draw.text((x + dx, y + dy), text, fill=(0, 0, 0), font=font)
+def _read_pid(path: Path) -> int | None:
+    try:
+        pid = int(path.read_text().strip() or "0")
+    except (ValueError, OSError):
+        return None
+    return pid if pid > 0 and pid != os.getpid() else None
 
-    draw.text((x, y), text, fill=color, font=font)
 
-    if accent:
-        draw.rectangle([0, R - BAR, R - 1, R - 1], fill=(*accent, 255))
+def running_monitor_pid(provider: str) -> int | None:
+    """PID of the live tray monitor for `provider`, verified via /proc."""
+    pid = _read_pid(lock_path(provider))
+    if pid is None:
+        return None
+    args = _monitor_args(pid)
+    if args is None:
+        return None
+    if (args[:2] == ["--provider", provider]
+            or args[:1] == [f"--provider={provider}"]
+            or (not args and provider == DEFAULT_PROVIDER)):
+        return pid
+    return None
 
-    return img.resize((OUT, OUT), Image.LANCZOS)
+
+def running_panel_pid() -> int | None:
+    """PID of the open combined panel (from any monitor), verified via /proc."""
+    pid = _read_pid(PANEL_LOCK)
+    if pid is None:
+        return None
+    args = _monitor_args(pid)
+    if args and args[0] == "--panel":
+        return pid
+    return None
+
+
+def panel_providers() -> list[str]:
+    """Providers the panel shows: those with a cache or a running monitor.
+
+    A provider that has never produced a reading and has no tray process is
+    simply not installed here, so it gets no section at all.
+    """
+    return [p for p in PROVIDERS
+            if cache_path(p).exists() or running_monitor_pid(p) is not None]
 
 
 # ── Dropdown Panel ───────────────────────────────────────────────
@@ -638,34 +941,67 @@ def format_reset(reset_val: str) -> str:
         except (ValueError, TypeError):
             return reset_val
 
-    diff = reset_dt - datetime.now(timezone.utc)
-    total_sec = max(0, int(diff.total_seconds()))
-    hours, rem = divmod(total_sec, 3600)
-    minutes, _ = divmod(rem, 60)
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    if minutes > 0:
-        return f"{minutes}m"
-    return "<1m"
+    total_sec = int((reset_dt - datetime.now(timezone.utc)).total_seconds())
+    if total_sec < 0:
+        # The window already rolled over after this (stale) reading.
+        return "passed"
+    return format_age(total_sec)
+
+
+def reset_passed(reset_val: str) -> bool:
+    return format_reset(reset_val) == "passed"
+
+
+# Panel layout. Fixed column widths keep the rows of every section aligned
+# with each other, so the bundle reads as one table.
+PANEL_MARK_SCALE = 2          # 16x16 tile -> 32x32, nearest-neighbour
+PANEL_INDENT = TILE * PANEL_MARK_SCALE + 10   # rows start under the label
+PANEL_BAR_W = 110
+PANEL_COL_MIN = (104, 40, PANEL_BAR_W + 8, 92)   # label, %, bar, reset
 
 
 class DropdownPanel:
-    """A floating dropdown panel that appears near the system tray."""
+    """One floating panel near the tray, bundling every provider's usage.
+
+    Whichever tray icon is clicked, the panel reads every provider's cache
+    itself and shows one section per provider, in PROVIDERS order.
+    """
 
     def __init__(self):
         self._win: tk.Tk | None = None
         self._lock = threading.Lock()
-        self._parent_pid: int | None = None
+        self._providers: list[str] = []
+        self._data: dict[str, dict | None] = {}
+        self._marks: dict[str, tk.PhotoImage] = {}
 
     def _color_for_percent(self, pct: int) -> str:
         return THEME[PANEL_COLOR_KEYS[usage_level(pct)]]
 
-    def _update_status(self, data):
-        status = (data or {}).get("status", "unknown")
-        color = THEME["green"] if status == "allowed" else THEME["red"]
-        self._status_label.config(text="● " + status.upper(), fg=color)
+    def _mark_image(self, provider: str) -> tk.PhotoImage:
+        """The tray sprite's brand tile, enlarged for the panel.
 
-    def _update_time(self, data):
+        Passed to Tk as PNG data so this needs no PIL.ImageTk (a separate
+        distro package); Tk 8.6 decodes PNG, alpha included.
+        """
+        if provider not in self._marks:
+            size = TILE * PANEL_MARK_SCALE
+            buf = io.BytesIO()
+            brand_tile(provider).resize((size, size), Image.NEAREST).save(
+                buf, "PNG")
+            self._marks[provider] = tk.PhotoImage(
+                master=self._win, data=base64.b64encode(buf.getvalue()))
+        return self._marks[provider]
+
+    @staticmethod
+    def _status_text(data):
+        if data and "error" in data:
+            return "● ERROR", THEME["red"]
+        status = (data or {}).get("status", "unknown") or "unknown"
+        color = THEME["green"] if status == "allowed" else THEME["red"]
+        return "● " + status.upper(), color
+
+    @staticmethod
+    def _time_text(provider, data):
         fetched, age = "", None
         if data and "fetched_at" in data:
             try:
@@ -676,116 +1012,142 @@ class DropdownPanel:
                 fetched = ft.astimezone().strftime("%H:%M:%S")
                 age = age_seconds(ft)
 
-        is_local = PROVIDERS[PROVIDER]["local"]
+        is_local = PROVIDERS[provider]["local"]
         color = THEME["subtext"]
         # For a local provider the number only moves when that CLI runs, so an
         # unqualified clock time would read as "live". Always state the age,
         # and flag it once the reading is old enough to be misleading.
-        if age is not None and (is_local or age > 600):
+        # With a refresh error the reading is the last good one, however
+        # recent its clock time looks, so its age is always shown then.
+        has_error = bool(data and "error" in data)
+        if age is not None and (is_local or has_error or age > 600):
             fetched += f"  ({format_age(age)} ago)"
-            if is_local and age > 3600:
+            if has_error or (is_local and age > 3600):
                 color = THEME["orange"]
-        self._time_label.config(text=fetched, fg=color)
+            if has_error:
+                fetched = "last good " + fetched
+        return fetched, color
 
-    def _fill_body(self, body, data):
-        """Fill body frame with data widgets."""
-        # Clear existing content
+    def _fill_body(self):
+        """(Re)build every provider section from self._data."""
+        body = self._body
         for w in body.winfo_children():
             w.destroy()
+        for i, provider in enumerate(self._providers):
+            if i:
+                tk.Frame(body, bg=THEME["surface2"],
+                         height=1).pack(fill=tk.X, pady=8)
+            self._fill_section(body, provider, self._data.get(provider))
+
+    def _fill_section(self, body, provider, data):
+        bg = THEME["bg"]
+        spec = PROVIDERS[provider]
+        section = tk.Frame(body, bg=bg)
+        section.pack(fill=tk.X)
+
+        # Section header: brand mark | label + plan / age | status
+        head = tk.Frame(section, bg=bg)
+        head.pack(fill=tk.X)
+        tk.Label(head, image=self._mark_image(provider), bg=bg,
+                 bd=0).pack(side=tk.LEFT, padx=(0, 10))
+
+        status_text, status_color = self._status_text(data)
+        tk.Label(head, text=status_text, font=("sans-serif", 8),
+                 bg=bg, fg=status_color).pack(side=tk.RIGHT, anchor=tk.N)
+
+        titles = tk.Frame(head, bg=bg)
+        titles.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        name_row = tk.Frame(titles, bg=bg)
+        name_row.pack(anchor=tk.W)
+        tk.Label(name_row, text=spec["label"],
+                 font=("sans-serif", 11, "bold"),
+                 bg=bg, fg=THEME["text"]).pack(side=tk.LEFT)
+        plan = (data or {}).get("plan", "")
+        if plan:
+            tk.Label(name_row, text=plan, font=("sans-serif", 9),
+                     bg=bg, fg=THEME["subtext"]).pack(side=tk.LEFT,
+                                                       padx=(6, 0))
+        time_text, time_color = self._time_text(provider, data)
+        tk.Label(titles, text=time_text, font=("sans-serif", 8),
+                 bg=bg, fg=time_color).pack(anchor=tk.W)
 
         if not data or "error" in data:
             err_msg = (data or {}).get("error", "No data yet")
-            tk.Label(body, text=f"! {err_msg}",
-                     font=("sans-serif", 10), bg=THEME["bg"],
-                     fg=THEME["orange"], wraplength=280,
-                     justify=tk.LEFT).pack(anchor=tk.W)
-        else:
-            windows = data.get("windows", {})
-            rep = normalize_rep(data.get("representative_claim", ""))
+            tk.Label(section, text=f"! {err_msg}",
+                     font=("sans-serif", 9), bg=bg,
+                     fg=THEME["orange"], wraplength=320,
+                     justify=tk.LEFT).pack(anchor=tk.W, padx=(PANEL_INDENT, 0),
+                                           pady=(4, 0))
+            # Below the error, still show the last good reading (if any);
+            # the header's "last good ... ago" line dates it.
+            if not (data or {}).get("windows"):
+                return
 
-            rendered = 0
-            for wid in WINDOW_ORDER:
-                if wid not in windows:
-                    continue
-                w = windows[wid]
-                try:
-                    util = float(w.get("utilization", 0))
-                except (TypeError, ValueError):
-                    util = 0.0
-                pct = int(util * 100)
-                is_rep = (wid == rep)
+        # One compact grid row per window: label, %, bar, reset.
+        rows = tk.Frame(section, bg=bg)
+        rows.pack(fill=tk.X, padx=(PANEL_INDENT, 0), pady=(4, 0))
+        for col, minsize in enumerate(PANEL_COL_MIN):
+            rows.grid_columnconfigure(col, minsize=minsize)
 
-                # Separate rows from each other — count what was actually
-                # drawn, not the position in WINDOW_ORDER. A provider whose
-                # only window sorts late (Codex/Grok have just "7d") would
-                # otherwise get a stray rule above its first row.
-                if rendered:
-                    tk.Frame(body, bg=THEME["surface2"],
-                             height=1).pack(fill=tk.X, pady=8)
-                rendered += 1
+        windows = data.get("windows", {})
+        rep = normalize_rep(data.get("representative_claim", ""))
+        r = 0
+        for wid in WINDOW_ORDER:
+            if wid not in windows:
+                continue
+            w = windows[wid]
+            util = parse_utilization(w.get("utilization", 0)) or 0.0
+            util = min(max(util, 0.0), 1.0)
+            pct = int(util * 100)
+            # A window whose reset already passed no longer holds this
+            # usage; grey it out so a stale 98% doesn't read as live.
+            stale = reset_passed(w.get("reset", ""))
+            color = (THEME["subtext"] if stale
+                     else self._color_for_percent(pct))
+            # Bold marks the window that drives this provider's tray number.
+            weight = "bold" if wid == rep else "normal"
 
-                row = tk.Frame(body, bg=THEME["bg"])
-                row.pack(fill=tk.X)
+            tk.Label(rows, text=WINDOW_LABELS.get(wid, wid),
+                     font=("sans-serif", 9, weight),
+                     bg=bg, fg=THEME["text"]).grid(row=r, column=0,
+                                                   sticky=tk.W)
+            tk.Label(rows, text=f"{pct}%", font=("sans-serif", 10, "bold"),
+                     bg=bg, fg=color).grid(row=r, column=1, sticky=tk.E,
+                                           padx=(0, 8))
 
-                tag = f"[{wid}]"
-                label = WINDOW_LABELS.get(wid, wid)
-                badge = "  ◀" if is_rep else ""
-                tk.Label(row, text=f"{tag}  {label}{badge}",
-                         font=("sans-serif", 11, "bold" if is_rep else ""),
-                         bg=THEME["bg"], fg=THEME["text"]).pack(
-                    side=tk.LEFT, anchor=tk.W)
+            bar = tk.Frame(rows, bg=THEME["surface"], width=PANEL_BAR_W,
+                           height=6)
+            bar.grid(row=r, column=2, sticky=tk.W)
+            bar.pack_propagate(False)
+            tk.Frame(bar, bg=color).place(
+                relwidth=min(max(util, 0.02), 1.0), relheight=1.0)
 
-                tk.Label(row, text=f"{pct}%",
-                         font=("sans-serif", 14, "bold"),
-                         bg=THEME["bg"],
-                         fg=self._color_for_percent(pct)).pack(
-                    side=tk.RIGHT, anchor=tk.E)
+            reset_text = f"reset {format_reset(w.get('reset', ''))}"
+            w_status = w.get("status", "")
+            if w_status and w_status != "allowed":
+                reset_text += f"  •  {w_status}"
+            tk.Label(rows, text=reset_text, font=("sans-serif", 8),
+                     bg=bg, fg=THEME["subtext"]).grid(row=r, column=3,
+                                                      sticky=tk.W)
+            r += 1
 
-                bar_frame = tk.Frame(body, bg=THEME["surface"],
-                                     height=10, padx=0, pady=0)
-                bar_frame.pack(fill=tk.X, pady=(4, 0))
-                bar_frame.pack_propagate(False)
+        notes = []
+        extra = data.get("extra", "")
+        if extra:
+            notes.append(extra)
+        overage = data.get("overage_status", "")
+        if overage and overage != "allowed":
+            reason = data.get("overage_disabled_reason", "")
+            overage_text = f"Overage: {overage}"
+            if reason:
+                overage_text += f" ({reason.replace('_', ' ')})"
+            notes.append(overage_text)
+        for note in notes:
+            tk.Label(section, text=note, font=("sans-serif", 8),
+                     bg=bg, fg=THEME["subtext"]).pack(
+                anchor=tk.W, padx=(PANEL_INDENT, 0), pady=(2, 0))
 
-                bar_color = self._color_for_percent(pct)
-                fill_width = min(max(util, 0.02), 1.0)
-                bar_fill = tk.Frame(bar_frame, bg=bar_color)
-                bar_fill.place(relwidth=fill_width, relheight=1.0)
-
-                reset_text = f"Resets in {format_reset(w.get('reset', ''))}"
-                w_status = w.get("status", "")
-                if w_status and w_status != "allowed":
-                    reset_text += f"  •  {w_status}"
-
-                tk.Label(body, text=reset_text,
-                         font=("sans-serif", 9),
-                         bg=THEME["bg"], fg=THEME["subtext"]).pack(
-                    anchor=tk.W, pady=(2, 0))
-
-            extra = data.get("extra", "")
-            if extra:
-                tk.Frame(body, bg=THEME["surface2"],
-                         height=1).pack(fill=tk.X, pady=8)
-                tk.Label(body, text=extra,
-                         font=("sans-serif", 9),
-                         bg=THEME["bg"], fg=THEME["subtext"]).pack(anchor=tk.W)
-
-            overage = data.get("overage_status", "")
-            if overage and overage != "allowed":
-                tk.Frame(body, bg=THEME["surface2"],
-                         height=1).pack(fill=tk.X, pady=8)
-                reason = data.get("overage_disabled_reason", "")
-                overage_text = f"Overage: {overage}"
-                if reason:
-                    overage_text += f" ({reason.replace('_', ' ')})"
-                tk.Label(body, text=overage_text,
-                         font=("sans-serif", 9),
-                         bg=THEME["bg"], fg=THEME["subtext"]).pack(
-                    anchor=tk.W)
-
-        return body
-
-    def show(self, data: dict | None, pos: tuple | None = None,
-             parent_pid: int | None = None):
+    def show(self, origin: str = DEFAULT_PROVIDER, pos: tuple | None = None):
         with self._lock:
             if self._win is not None:
                 try:
@@ -794,7 +1156,24 @@ class DropdownPanel:
                     pass
                 self._win = None
 
-        self._parent_pid = parent_pid
+        # Exactly one bundle on screen: replace a panel another tray icon
+        # opened, then record ourselves so the next click can find us.
+        old = running_panel_pid()
+        if old is not None:
+            try:
+                os.kill(old, signal.SIGTERM)
+            except OSError:
+                pass
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            PANEL_LOCK.write_text(str(os.getpid()))
+        except OSError:
+            pass
+
+        # The clicked provider always gets a section, even before it has
+        # written its first cache.
+        self._providers = panel_providers() or [origin]
+        self._data = {p: load_panel_data(p) for p in self._providers}
 
         win = tk.Tk()
         self._win = win
@@ -815,36 +1194,23 @@ class DropdownPanel:
         container.pack(fill=tk.BOTH, expand=True)
 
         # Header
-        header = tk.Frame(container, bg=THEME["surface"], padx=16, pady=10)
+        header = tk.Frame(container, bg=THEME["surface"], padx=16, pady=8)
         header.pack(fill=tk.X)
-
-        title = PROVIDERS[PROVIDER]["label"]
-        plan = (data or {}).get("plan", "")
-        if plan:
-            title += f"  ({plan})"
-        tk.Label(header, text=title,
+        tk.Label(header, text="AI Usage",
                  font=("sans-serif", 12, "bold"),
                  bg=THEME["surface"], fg=THEME["text"]).pack(side=tk.LEFT)
-
-        self._status_label = tk.Label(header, text="", font=("sans-serif", 9),
-                                      bg=THEME["surface"])
-        self._status_label.pack(side=tk.RIGHT)
-        self._update_status(data)
+        self._hint_label = tk.Label(header, text="", font=("sans-serif", 8),
+                                    bg=THEME["surface"], fg=THEME["subtext"])
+        self._hint_label.pack(side=tk.RIGHT)
 
         # Body (replaceable)
         self._body = tk.Frame(container, bg=THEME["bg"], padx=16, pady=12)
         self._body.pack(fill=tk.X)
-        self._fill_body(self._body, data)
+        self._fill_body()
 
         # Footer
         footer = tk.Frame(container, bg=THEME["surface"], padx=16, pady=8)
         footer.pack(fill=tk.X, side=tk.BOTTOM)
-
-        self._time_label = tk.Label(footer, text="",
-                                    font=("sans-serif", 8),
-                                    bg=THEME["surface"], fg=THEME["subtext"])
-        self._time_label.pack(side=tk.LEFT)
-        self._update_time(data)
 
         # Button bar
         btn_frame = tk.Frame(footer, bg=THEME["surface"])
@@ -856,22 +1222,31 @@ class DropdownPanel:
                                cursor="hand2", padx=6, pady=2)
         refresh_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        # Network fetch runs on a worker thread, but every Tk call must happen
-        # on the main thread. The worker only does I/O and hands the result
-        # back through this queue; a main-thread poller applies it to the UI.
+        # Fetches run on a worker thread, but every Tk call must happen on
+        # the main thread. The worker only does I/O and hands the results
+        # back through this queue; a main-thread poller applies them.
         result_q: queue.Queue = queue.Queue()
 
         def _run_refresh():
-            new_data = fetch_for_provider(PROVIDER)
-            if new_data is not None and "error" not in new_data:
-                save_cache(new_data)
-                # Cache changed — ask the main process to reload it.
+            results = {}
+            for provider in self._providers:
+                try:
+                    new_data = fetch_for_provider(provider)
+                except Exception as e:   # one provider must not sink the rest
+                    new_data = {"error": f"Refresh failed: {e}"}
+                if new_data is None:
+                    new_data = {"error": "Claude Code not logged in"}
+                if "error" not in new_data:
+                    save_cache(new_data, provider)
+                save_status(provider, new_data.get("error"))
+                # Ask that provider's tray to reload cache + status.
                 try:
                     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                    REFRESH_TRIGGER.touch()
+                    trigger_path(provider).touch()
                 except OSError:
                     pass
-            result_q.put(new_data)  # None means "not logged in"
+                results[provider] = new_data
+            result_q.put(results)
 
         def _done_refresh():
             if not win.winfo_exists():
@@ -880,27 +1255,21 @@ class DropdownPanel:
             self._refreshing = False
             win.focus_force()
 
-        def _update_ui(new_data):
-            if not win.winfo_exists():
-                return
-            self._fill_body(self._body, new_data)
-            self._update_status(new_data)
-            self._update_time(new_data)
-            _done_refresh()
-            win.update_idletasks()
-
         def _poll_result():
             if not win.winfo_exists():
                 return
             try:
-                new_data = result_q.get_nowait()
+                results = result_q.get_nowait()
             except queue.Empty:
                 win.after(100, _poll_result)
                 return
-            if new_data is not None:
-                _update_ui(new_data)
-            else:
-                _done_refresh()
+            for provider in results:
+                # Re-read so an error keeps the last good windows under it.
+                self._data[provider] = load_panel_data(provider)
+            self._fill_body()
+            _done_refresh()
+            win.update_idletasks()
+            _place()
 
         def do_refresh(e=None):
             if self._refreshing:
@@ -913,37 +1282,46 @@ class DropdownPanel:
 
         refresh_btn.bind("<Button-1>", do_refresh)
 
-        # Quit button - kills the monitor process that spawned this panel
+        # Quit button - the icons are one bundle, so stop every monitor
         quit_btn = tk.Label(btn_frame, text="  Quit  ",
                             font=("sans-serif", 10, "bold"),
                             bg=THEME["red"], fg="#1e1e2e",
                             cursor="hand2", padx=6, pady=2)
         quit_btn.pack(side=tk.LEFT)
 
-        def quit_monitor(e=None):
-            # Signal only the parent monitor by PID — never a broad pgrep
-            # that could match an editor or unrelated 'monitor.py' process.
-            try:
-                if self._parent_pid:
-                    os.kill(self._parent_pid, signal.SIGTERM)
-            except OSError:
-                pass
+        def quit_monitors(e=None):
+            # Signal each monitor by the PID in its own lock file, and only
+            # once /proc confirms it is that provider's monitor.py — never a
+            # broad pgrep/pkill that could hit an editor or unrelated process.
+            for provider in PROVIDERS:
+                pid = running_monitor_pid(provider)
+                if pid is None:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
             self._close()
 
-        quit_btn.bind("<Button-1>", quit_monitor)
+        quit_btn.bind("<Button-1>", quit_monitors)
+
+        self._hint_label.config(
+            text=f"{len(self._providers)} provider"
+                 f"{'' if len(self._providers) == 1 else 's'}")
 
         # Position & size
+        def _place():
+            w = win.winfo_reqwidth()
+            h = win.winfo_reqheight()
+            screen_w = win.winfo_screenwidth()
+            screen_h = win.winfo_screenheight()
+            # Below the tray area, aligned near mouse X, kept on screen.
+            x = max(8, min(mx - w // 2, screen_w - w - 8))
+            y = max(8, min(my + 10, screen_h - h - 8))
+            win.geometry(f"{w}x{h}+{x}+{y}")
+
         win.update_idletasks()
-        w = win.winfo_reqwidth()
-        h = win.winfo_reqheight()
-        screen_w = win.winfo_screenwidth()
-
-        # Position below the tray area, aligned near mouse X
-        x = min(mx - w // 2, screen_w - w - 8)
-        x = max(8, x)
-        y = my + 10  # just below the click point
-
-        win.geometry(f"{w}x{h}+{x}+{y}")
+        _place()
 
         # Close on focus loss, Escape, or the pointer leaving the panel.
         def on_focus_out(e):
@@ -975,13 +1353,13 @@ class DropdownPanel:
                 if self._refreshing:
                     win.after(150, check_outside)
                     return
-                mx = win.winfo_pointerx()
-                my = win.winfo_pointery()
+                px = win.winfo_pointerx()
+                py = win.winfo_pointery()
                 wx = win.winfo_rootx()
                 wy = win.winfo_rooty()
                 ww = win.winfo_width()
                 wh = win.winfo_height()
-                inside = wx <= mx <= wx + ww and wy <= my <= wy + wh
+                inside = wx <= px <= wx + ww and wy <= py <= wy + wh
                 if inside:
                     self._entered = True
                     self._outside_count = 0
@@ -1000,7 +1378,10 @@ class DropdownPanel:
 
         win.focus_force()
         win.after(500, check_outside)
-        win.mainloop()
+        try:
+            win.mainloop()
+        finally:
+            release_panel_lock()
 
     def _close(self):
         with self._lock:
@@ -1010,6 +1391,14 @@ class DropdownPanel:
                 except tk.TclError:
                     pass
                 self._win = None
+
+
+def release_panel_lock():
+    try:
+        if PANEL_LOCK.exists() and PANEL_LOCK.read_text().strip() == str(os.getpid()):
+            PANEL_LOCK.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ── Main App ─────────────────────────────────────────────────────
@@ -1035,14 +1424,14 @@ class UsageMonitor:
         try:
             data = fetch_for_provider(PROVIDER)
             if data is None:
-                self.usage_data = {"error": "Claude Code not logged in"}
-                self._update_icon()
-                return
+                data = {"error": "Claude Code not logged in"}
 
             with self._lock:
                 self.usage_data = data
                 if "error" not in data:
                     save_cache(data)
+                # Lets the shared panel show this icon's current error.
+                save_status(PROVIDER, data.get("error"))
             self._update_icon()
         finally:
             self._refresh_inflight.release()
@@ -1054,7 +1443,7 @@ class UsageMonitor:
         has_error = bool(data and "error" in data)
         pct = get_primary_percent(data)
         spec = PROVIDERS[PROVIDER]
-        self.icon.icon = make_icon(pct, error=has_error, accent=spec["accent"])
+        self.icon.icon = make_icon(PROVIDER, pct, error=has_error)
         if has_error:
             self.icon.title = f"{spec['label']}: {data['error']}"
         elif pct is not None:
@@ -1084,10 +1473,15 @@ class UsageMonitor:
                 REFRESH_TRIGGER.unlink(missing_ok=True)
             except OSError:
                 pass
-            data = load_cache()
-            if data is not None:
-                with self._lock:
+            # Same lock refresh() holds while it records a result, so an
+            # error it records can't be overwritten by a cache read that
+            # started just before it.
+            with self._lock:
+                err = load_status_error(PROVIDER)
+                data = {"error": err} if err else load_cache()
+                if data is not None:
                     self.usage_data = data
+            if data is not None:
                 self._update_icon()
         self._poll_timer = threading.Timer(2.0, self._poll_trigger)
         self._poll_timer.daemon = True
@@ -1123,13 +1517,21 @@ class UsageMonitor:
             self._panel_proc = None
             return
 
+        # The panel is shared by every tray icon, so one opened from another
+        # icon toggles closed here too, instead of a second one stacking up.
+        other = running_panel_pid()
+        if other is not None:
+            try:
+                os.kill(other, signal.SIGTERM)
+            except OSError:
+                pass
+            return
+
         # Spawn the panel as an isolated subprocess. It reads the pointer
-        # position itself, so we never create a Tk root inside this
-        # pystray/GTK process. The parent PID lets its Quit button signal us.
-        data_json = json.dumps(self.usage_data or {})
+        # position and every provider's cache itself, so we never create a Tk
+        # root inside this pystray/GTK process and pass it only our provider.
         self._panel_proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__),
-             "--panel", data_json, str(os.getpid()), PROVIDER],
+            [sys.executable, os.path.abspath(__file__), "--panel", PROVIDER],
             start_new_session=True,
         )
 
@@ -1225,9 +1627,8 @@ class UsageMonitor:
 
         self.icon = pystray.Icon(
             name=f"{APP_NAME}-{PROVIDER}",
-            icon=make_icon(get_primary_percent(self.usage_data),
-                           error=bool(self.usage_data and "error" in self.usage_data),
-                           accent=spec["accent"]),
+            icon=make_icon(PROVIDER, get_primary_percent(self.usage_data),
+                           error=bool(self.usage_data and "error" in self.usage_data)),
             title=f"{spec['label']} Usage Monitor",
             menu=pystray.Menu(
                 pystray.MenuItem("Show Details", self.on_details, default=True),
@@ -1287,20 +1688,11 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     # Subprocess mode: show panel and exit
-    if len(sys.argv) >= 3 and sys.argv[1] == "--panel":
-        try:
-            data = json.loads(sys.argv[2])
-        except json.JSONDecodeError:
-            data = None
-        parent_pid = None
-        if len(sys.argv) >= 4:
-            try:
-                parent_pid = int(sys.argv[3])
-            except ValueError:
-                pass
-        if len(sys.argv) >= 5 and sys.argv[4] in PROVIDERS:
-            select_provider(sys.argv[4])
-        DropdownPanel().show(data, parent_pid=parent_pid)
+    # (`--panel <provider>`; the provider is the icon that was clicked).
+    if len(sys.argv) >= 2 and sys.argv[1] == "--panel":
+        origin = next((a for a in reversed(sys.argv[2:]) if a in PROVIDERS),
+                      DEFAULT_PROVIDER)
+        DropdownPanel().show(origin)
         return
 
     provider = DEFAULT_PROVIDER
